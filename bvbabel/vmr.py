@@ -1,462 +1,296 @@
-"""Read, write, create BrainVoyager VMR file format."""
+"""Read, write, create BrainVoyager VMR file format.
+
+Provides both a modern typed-object API (``VMR`` class) and backward-
+compatible procedural shims (``read_vmr``, ``write_vmr``, ``create_vmr``).
+
+Typed API
+---------
+    vmr = VMR.read("subject01.vmr")
+    print(vmr.dim_x, vmr.data.shape)
+    vmr.write("output.vmr")
+
+Procedural API (backward-compatible)
+------------------------------------
+    header, data = bvbabel.vmr.read_vmr("subject01.vmr")
+    bvbabel.vmr.write_vmr("output.vmr", header, data)
+    header, data = bvbabel.vmr.create_vmr()
+"""
 
 import struct
 import numpy as np
-from bvbabel.utils import (read_variable_length_string,
-                           write_variable_length_string)
+from bvbabel._binary_format import (
+    Field, DataField, SubRecordListField, BinaryFormat, register_format
+)
+from bvbabel.utils import (
+    read_variable_length_string, write_variable_length_string
+)
+
+
+# ---------------------------------------------------------------------------
+# Axis transforms (BV internal ↔ Talairach / NIfTI RAS-like)
+# ---------------------------------------------------------------------------
+
+def _bv_to_tal(data):
+    """Convert on-disk BV axis layout to logical (Talairach-like) layout."""
+    data = np.transpose(data, (0, 2, 1))
+    data = data[::-1, ::-1, ::-1]
+    return data
+
+
+_bv_to_tal_inv = _bv_to_tal  # transpose + flip is its own inverse
+
+
+# ---------------------------------------------------------------------------
+# Past-transformation sub-record helpers
+# ---------------------------------------------------------------------------
+
+def _read_past_transformation(f):
+    """Read a single past-spatial-transformation record."""
+    name = read_variable_length_string(f)
+    tr_type, = struct.unpack("<i", f.read(4))
+    source = read_variable_length_string(f)
+    nr_values, = struct.unpack("<i", f.read(4))
+    values = []
+    for _ in range(nr_values):
+        v, = struct.unpack("<f", f.read(4))
+        values.append(v)
+    return {
+        "Name": name,
+        "Type": tr_type,
+        "SourceFileName": source,
+        "NrOfValues": nr_values,
+        "Values": values,
+    }
+
+
+def _write_past_transformation(f, record):
+    """Write a single past-spatial-transformation record."""
+    write_variable_length_string(f, record["Name"])
+    f.write(struct.pack("<i", record["Type"]))
+    write_variable_length_string(f, record["SourceFileName"])
+    f.write(struct.pack("<i", record["NrOfValues"]))
+    for v in record["Values"]:
+        f.write(struct.pack("<f", v))
+
+
+# ---------------------------------------------------------------------------
+# Typed VMR format
+# ---------------------------------------------------------------------------
+
+@register_format(".vmr")
+class VMR(BinaryFormat):
+    """Typed BrainVoyager VMR (volumetric anatomical dataset).
+
+    Field order matches the on-disk layout exactly: pre-data header,
+    raw voxel data, post-data header with conditional (version-gated)
+    fields, and optional past-spatial-transformation records.
+    """
+
+    # -- Pre-data header -------------------------------------------------
+    file_version = Field("<H")
+    dim_x = Field("<H")
+    dim_y = Field("<H")
+    dim_z = Field("<H")
+
+    # -- Voxel data (BV internal layout → Talairach layout on read) ------
+    data = DataField(
+        dtype="<B",
+        shape_fields=("dim_z", "dim_y", "dim_x"),
+        transform=_bv_to_tal,
+        inverse_transform=_bv_to_tal_inv,
+    )
+
+    # -- Post-data header ------------------------------------------------
+    offset_x = Field(
+        "<h", condition=lambda s: s.file_version >= 3, default=0
+    )
+    offset_y = Field(
+        "<h", condition=lambda s: s.file_version >= 3, default=0
+    )
+    offset_z = Field(
+        "<h", condition=lambda s: s.file_version >= 3, default=0
+    )
+    framing_cube_dim = Field(
+        "<h", condition=lambda s: s.file_version >= 3, default=256
+    )
+
+    pos_infos_verified = Field("<i", default=1)
+    coordinate_system = Field("<i", default=0)
+
+    slice_1_center_x = Field("<f", default=-87.5)
+    slice_1_center_y = Field("<f", default=0.0)
+    slice_1_center_z = Field("<f", default=0.0)
+    slice_n_center_x = Field("<f", default=87.5)
+    slice_n_center_y = Field("<f", default=0.0)
+    slice_n_center_z = Field("<f", default=0.0)
+
+    row_dir_x = Field("<f", default=0.0)
+    row_dir_y = Field("<f", default=1.0)
+    row_dir_z = Field("<f", default=0.0)
+    col_dir_x = Field("<f", default=0.0)
+    col_dir_y = Field("<f", default=0.0)
+    col_dir_z = Field("<f", default=-1.0)
+
+    n_rows = Field("<i", default=256)
+    n_cols = Field("<i", default=256)
+
+    fov_rows = Field("<f", default=256.0)
+    fov_cols = Field("<f", default=256.0)
+    slice_thickness = Field("<f", default=1.0)
+    gap_thickness = Field("<f", default=0.0)
+
+    nr_of_past_spatial_transformations = Field("<i", default=0)
+
+    past_transformations = SubRecordListField(
+        count_field="nr_of_past_spatial_transformations",
+        read_record=_read_past_transformation,
+        write_record=_write_past_transformation,
+    )
+
+    left_right_convention = Field("<B", default=1)
+
+    reference_space_vmr = Field(
+        "<B",
+        condition=lambda s: s.file_version >= 4,
+        default=0,
+    )
+
+    voxel_size_x = Field("<f", default=1.0)
+    voxel_size_y = Field("<f", default=1.0)
+    voxel_size_z = Field("<f", default=1.0)
+
+    voxel_resolution_verified = Field("<B", default=1)
+    voxel_resolution_in_tal_mm = Field("<B", default=1)
+
+    vmr_orig_v16_min_value = Field("<i", default=-1)
+    vmr_orig_v16_mean_value = Field("<i", default=-1)
+    vmr_orig_v16_max_value = Field("<i", default=-1)
+
+    # ------------------------------------------------------------------
+    # Legacy-key mapping (Python attr name → original dict key)
+    # ------------------------------------------------------------------
+    _LEGACY_MAP = {
+        "file_version": "File version",
+        "dim_x": "DimX",
+        "dim_y": "DimY",
+        "dim_z": "DimZ",
+        "offset_x": "OffsetX",
+        "offset_y": "OffsetY",
+        "offset_z": "OffsetZ",
+        "framing_cube_dim": "FramingCubeDim",
+        "pos_infos_verified": "PosInfosVerified",
+        "coordinate_system": "CoordinateSystem",
+        "slice_1_center_x": "Slice1CenterX",
+        "slice_1_center_y": "Slice1CenterY",
+        "slice_1_center_z": "Slice1CenterZ",
+        "slice_n_center_x": "SliceNCenterX",
+        "slice_n_center_y": "SliceNCenterY",
+        "slice_n_center_z": "SliceNCenterZ",
+        "row_dir_x": "RowDirX",
+        "row_dir_y": "RowDirY",
+        "row_dir_z": "RowDirZ",
+        "col_dir_x": "ColDirX",
+        "col_dir_y": "ColDirY",
+        "col_dir_z": "ColDirZ",
+        "n_rows": "NRows",
+        "n_cols": "NCols",
+        "fov_rows": "FoVRows",
+        "fov_cols": "FoVCols",
+        "slice_thickness": "SliceThickness",
+        "gap_thickness": "GapThickness",
+        "nr_of_past_spatial_transformations": "NrOfPastSpatialTransformations",
+        "past_transformations": "PastTransformation",
+        "left_right_convention": "LeftRightConvention",
+        "reference_space_vmr": "ReferenceSpaceVMR",
+        "voxel_size_x": "VoxelSizeX",
+        "voxel_size_y": "VoxelSizeY",
+        "voxel_size_z": "VoxelSizeZ",
+        "voxel_resolution_verified": "VoxelResolutionVerified",
+        "voxel_resolution_in_tal_mm": "VoxelResolutionInTALmm",
+        "vmr_orig_v16_min_value": "VMROrigV16MinValue",
+        "vmr_orig_v16_mean_value": "VMROrigV16MeanValue",
+        "vmr_orig_v16_max_value": "VMROrigV16MaxValue",
+    }
+    # Reverse map for reading legacy dicts
+    _LEGACY_REVERSE = {v: k for k, v in _LEGACY_MAP.items()}
+
+    def to_legacy_dict(self):
+        """Export header as a dict with original BrainVoyager key names.
+
+        Uses the descriptor protocol so that unset fields return their
+        declared defaults, matching the original ``create_vmr()`` behaviour.
+        """
+        result = {}
+        for py_name, legacy_name in self._LEGACY_MAP.items():
+            val = getattr(self, py_name, None)
+            result[legacy_name] = val
+        return result
+
+    @classmethod
+    def from_legacy_dict(cls, d, data=None):
+        """Create a VMR instance from a legacy-format dict."""
+        kwargs = {}
+        for legacy_name, py_name in cls._LEGACY_REVERSE.items():
+            if legacy_name in d:
+                kwargs[py_name] = d[legacy_name]
+        instance = cls(**kwargs)
+        if data is not None:
+            instance.data = data
+        return instance
+
+    # ------------------------------------------------------------------
+    # Factory
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def create_default(cls, dim_x=256, dim_y=256, dim_z=256):
+        """Return a new VMR instance populated with sensible defaults.
+
+        The voxel data is initialised with random values in [0, 225] as
+        unsigned 8-bit integers.
+        """
+        vmr = cls()
+        vmr.file_version = 4
+        vmr.dim_x = dim_x
+        vmr.dim_y = dim_y
+        vmr.dim_z = dim_z
+        # Post-data header defaults are already set by Field defaults
+        # Generate random data
+        shape = (dim_z, dim_y, dim_x)
+        vmr.data = (np.random.random(np.prod(shape)) * 225).astype(
+            np.uint8
+        ).reshape(shape)
+        return vmr
 
 
 # =============================================================================
+# Backward-compatible procedural shims
+# =============================================================================
+
 def read_vmr(filename):
-    """Read BrainVoyager VMR file.
+    """Read BrainVoyager VMR file (legacy API).
 
-    Parameters
-    ----------
-    filename : string
-        Path to file.
-
-    Returns
-    -------
-    header : dictionary
-        Pre-data and post-data headers.
-    data : 3D numpy.array
-        Image data.
-
+    Returns (header_dict, data_ndarray).
     """
-    header = dict()
-    with open(filename, 'rb') as f:
-        # ---------------------------------------------------------------------
-        # VMR Pre-Data Header
-        # ---------------------------------------------------------------------
-        # NOTE(Developer Guide 2.6): VMR files contain anatomical 3D data sets,
-        # typically containing the whole brain (head) of subjects. The
-        # intensity values are stored as a series of bytes. See the V16 format
-        # for a version storing each intensity value with two bytes (short
-        # integers). The VMR format contains a small header followed by the
-        # actual data followed by a second, more extensive, header. The current
-        # version of VMR files is "4", which is only slightly different from
-        # version 3 (as indicated below). Version 3 added offset values to
-        # format 2 in order to represent large data sets efficiently, e.g. in
-        # the context of advanced segmentation processing. Compared to the
-        # original file version "1", file versions 2 and higher contain
-        # additional header information after the actual data ("post-data
-        # header"). This allows to read VMR data sets with minimal header
-        # checking if the extended information is not needed. The information
-        # in the post-data header contains position information (if available)
-        # and stores a series of spatial transformations, which might have been
-        # performed to the original data set ("history record"). The
-        # post-header data can be probably ignored for custom routines, but is
-        # important in BrainVoyager QX for spatial transformation and
-        # coregistration routines as well as for proper visualization.
-
-        # Expected binary data: unsigned short int (2 bytes)
-        data, = struct.unpack('<H', f.read(2))
-        header["File version"] = data
-        data, = struct.unpack('<H', f.read(2))
-        header["DimX"] = data
-        data, = struct.unpack('<H', f.read(2))
-        header["DimY"] = data
-        data, = struct.unpack('<H', f.read(2))
-        header["DimZ"] = data
-
-        # ---------------------------------------------------------------------
-        # VMR Data
-        # ---------------------------------------------------------------------
-        # NOTE(Developer Guide 2.6): Each data element (intensity value) is
-        # represented in 1 byte. The data is organized in three loops:
-        #   DimZ
-        #       DimY
-        #           DimX
-        #
-        # The axes terminology follows the internal BrainVoyager (BV) format.
-        # The mapping to Talairach axes is as follows:
-        #   BV (X front -> back) [axis 2 after np.reshape] = Y in Tal space
-        #   BV (Y top -> bottom) [axis 1 after np.reshape] = Z in Tal space
-        #   BV (Z left -> right) [axis 0 after np.reshape] = X in Tal space
-
-        # Expected binary data: unsigned char (1 byte)
-        data_img = np.zeros((header["DimZ"] * header["DimY"] * header["DimX"]),
-                            dtype='<B')
-        data_img = np.fromfile(f, dtype='<B', count=data_img.size, sep="",
-                               offset=0)
-        data_img = np.reshape(
-            data_img, (header["DimZ"], header["DimY"], header["DimX"]))
-
-        data_img = np.transpose(data_img, (0, 2, 1))  # BV to Tal
-        data_img = data_img[::-1, ::-1, ::-1]  # Flip BV axes
-
-        # ---------------------------------------------------------------------
-        # VMR Post-Data Header
-        # ---------------------------------------------------------------------
-        # NOTE(Developer Guide 2.6): The first four entries of the post-data
-        # header are new since file version "3" and contain offset values for
-        # each dimension as well as a value indicating the size of a cube with
-        # iso-dimensions to which the data set will be internally "expanded"
-        # for certain operations. The axes labels are in terms of
-        # BrainVoyager's internal format. These four entries are followed by
-        # scan position information from the original file headers, e.g. from
-        # DICOM files. The coordinate axes labels in these entries are not in
-        # terms of BrainVoyager's internal conventions but follow the DICOM
-        # standard. Then follows eventually a section listing spatial
-        # transformations which have been eventually performed to create the
-        # current VMR (e.g. ACPC transformation). Finally, additional
-        # information further descries the data set, including the assumed
-        # left-right convention, the reference space (e.g. Talairach after
-        # normalization) and voxel resolution.
-
-        if header["File version"] >= 3:
-            # NOTE(Developer Guide 2.6): These four entries have been added in
-            # file version "3" with BrainVoyager QX 1.7. All other entries are
-            # identical to file version "2".
-
-            # Expected binary data: short int (2 bytes)
-            data, = struct.unpack('<h', f.read(2))
-            header["OffsetX"] = data
-            data, = struct.unpack('<h', f.read(2))
-            header["OffsetY"] = data
-            data, = struct.unpack('<h', f.read(2))
-            header["OffsetZ"] = data
-            data, = struct.unpack('<h', f.read(2))
-            header["FramingCubeDim"] = data
-
-        # Expected binary data: int (4 bytes)
-        data, = struct.unpack('<i', f.read(4))
-        header["PosInfosVerified"] = data
-        data, = struct.unpack('<i', f.read(4))
-        header["CoordinateSystem"] = data
-
-        # Expected binary data: float (4 bytes)
-        data, = struct.unpack('<f', f.read(4))
-        header["Slice1CenterX"] = data  # First slice center X coordinate
-        data, = struct.unpack('<f', f.read(4))
-        header["Slice1CenterY"] = data  # First slice center Y coordinate
-        data, = struct.unpack('<f', f.read(4))
-        header["Slice1CenterZ"] = data  # First slice center Z coordinate
-        data, = struct.unpack('<f', f.read(4))
-        header["SliceNCenterX"] = data  # Last slice center X coordinate
-        data, = struct.unpack('<f', f.read(4))
-        header["SliceNCenterY"] = data  # Last slice center Y coordinate
-        data, = struct.unpack('<f', f.read(4))
-        header["SliceNCenterZ"] = data  # Last slice center Z coordinate
-        data, = struct.unpack('<f', f.read(4))
-        header["RowDirX"] = data  # Slice row direction vector X component
-        data, = struct.unpack('<f', f.read(4))
-        header["RowDirY"] = data  # Slice row direction vector Y component
-        data, = struct.unpack('<f', f.read(4))
-        header["RowDirZ"] = data  # Slice row direction vector Z component
-        data, = struct.unpack('<f', f.read(4))
-        header["ColDirX"] = data  # Slice column direction vector X component
-        data, = struct.unpack('<f', f.read(4))
-        header["ColDirY"] = data  # Slice column direction vector Y component
-        data, = struct.unpack('<f', f.read(4))
-        header["ColDirZ"] = data  # Slice column direction vector Z component
-
-        # Expected binary data: int (4 bytes)
-        data, = struct.unpack('<i', f.read(4))
-        header["NRows"] = data  # Nr of rows of slice image matrix
-        data, = struct.unpack('<i', f.read(4))
-        header["NCols"] = data  # Nr of columns of slice image matrix
-
-        # Expected binary data: float (4 bytes)
-        data, = struct.unpack('<f', f.read(4))
-        header["FoVRows"] = data  # Field of view extent in row direction [mm]
-        data, = struct.unpack('<f', f.read(4))
-        header["FoVCols"] = data  # Field of view extent in column dir. [mm]
-        data, = struct.unpack('<f', f.read(4))
-        header["SliceThickness"] = data  # Slice thickness [mm]
-        data, = struct.unpack('<f', f.read(4))
-        header["GapThickness"] = data  # Gap thickness [mm]
-
-        # Expected binary data: int (4 bytes)
-        data, = struct.unpack('<i', f.read(4))
-        header["NrOfPastSpatialTransformations"] = data
-
-        if header["NrOfPastSpatialTransformations"] != 0:
-            # NOTE(Developer Guide 2.6): For each past transformation, the
-            # information specified in the following table is stored. The
-            # "type of transformation" is a value determining how many
-            # subsequent values define the transformation:
-            #   "1": Rigid body+scale (3 translation, 3 rotation, 3 scale)
-            #   "2": Affine transformation (16 values, 4x4 matrix)
-            #   "4": Talairach transformation
-            #   "5": Un-Talairach transformation (1 - 5 -> BV axes)
-            header["PastTransformation"] = []
-            for i in range(header["NrOfPastSpatialTransformations"]):
-                header["PastTransformation"].append(dict())
-
-                # Expected binary data: variable-length string
-                data = read_variable_length_string(f)
-                header["PastTransformation"][i]["Name"] = data
-
-                # Expected binary data: int (4 bytes)
-                data, = struct.unpack('<i', f.read(4))
-                header["PastTransformation"][i]["Type"] = data
-
-                # Expected binary data: variable-length string
-                data = read_variable_length_string(f)
-                header["PastTransformation"][i]["SourceFileName"] = data
-
-                # Expected binary data: int (4 bytes)
-                data, = struct.unpack('<i', f.read(4))
-                header["PastTransformation"][i]["NrOfValues"] = data
-
-                # Store transformation values as a list
-                trans_values = []
-                for j in range(header["PastTransformation"][i]["NrOfValues"]):
-                    # Expected binary data: float (4 bytes)
-                    data, = struct.unpack('<f', f.read(4))
-                    trans_values.append(data)
-                header["PastTransformation"][i]["Values"] = trans_values
-
-        # Expected binary data: char (1 byte)
-        data, = struct.unpack('<B', f.read(1))
-        header["LeftRightConvention"] = data  # modified in v4
-
-        if header["File version"] >= 4:
-            data, = struct.unpack('<B', f.read(1))
-            header["ReferenceSpaceVMR"] = data  # new in v4
-
-        # Expected binary data: float (4 bytes)
-        data, = struct.unpack('<f', f.read(4))
-        header["VoxelSizeX"] = data  # Voxel resolution along X axis
-        data, = struct.unpack('<f', f.read(4))
-        header["VoxelSizeY"] = data  # Voxel resolution along Y axis
-        data, = struct.unpack('<f', f.read(4))
-        header["VoxelSizeZ"] = data  # Voxel resolution along Z axis
-
-        # Expected binary data: char (1 byte)
-        data, = struct.unpack('<B', f.read(1))
-        header["VoxelResolutionVerified"] = data
-        data, = struct.unpack('<B', f.read(1))
-        header["VoxelResolutionInTALmm"] = data
-
-        # Expected binary data: int (4 bytes)
-        data, = struct.unpack('<i', f.read(4))
-        header["VMROrigV16MinValue"] = data  # 16-bit data min intensity
-        data, = struct.unpack('<i', f.read(4))
-        header["VMROrigV16MeanValue"] = data  # 16-bit data mean intensity
-        data, = struct.unpack('<i', f.read(4))
-        header["VMROrigV16MaxValue"] = data  # 16-bit data max intensity
-
-    return header, data_img
+    vmr = VMR.read(filename)
+    header = vmr.to_legacy_dict()
+    data = vmr.data
+    return header, data
 
 
-# =============================================================================
 def write_vmr(filename, header, data_img):
-    """Protocol to write BrainVoyager VMR file.
-
-    Parameters
-    ----------
-    filename : string
-        Output filename.
-    header : dictionary
-        Header of VMR file.
-    data_img : numpy.array, 3D
-        Image.
-
-    """
-    with open(filename, 'wb') as f:
-        # ---------------------------------------------------------------------
-        # VMR Pre-Data Header
-        # ---------------------------------------------------------------------
-        # Expected binary data: unsigned short int (2 bytes)
-        data = header["File version"]
-        f.write(struct.pack('<H', data))
-        data = header["DimX"]
-        f.write(struct.pack('<H', data))
-        data = header["DimY"]
-        f.write(struct.pack('<H', data))
-        data = header["DimZ"]
-        f.write(struct.pack('<H', data))
-
-        # ---------------------------------------------------------------------
-        # VMR Data
-        # ---------------------------------------------------------------------
-        # Convert axes from Nifti standard back to BV standard
-        data_img = data_img[::-1, ::-1, ::-1]  # Flip BV axes
-        data_img = np.transpose(data_img, (0, 2, 1))  # BV to Tal
-
-        # Expected binary data: unsigned char (1 or 2 byte)
-        f.write(data_img.astype("<B").tobytes(order="C"))
-
-        # ---------------------------------------------------------------------
-        # VMR Post-Data Header
-        # ---------------------------------------------------------------------
-        if header["File version"] >= 3:
-            # Expected binary data: short int (2 bytes)
-            data = header["OffsetX"]
-            f.write(struct.pack('<h', data))
-            data = header["OffsetY"]
-            f.write(struct.pack('<h', data))
-            data = header["OffsetZ"]
-            f.write(struct.pack('<h', data))
-            data = header["FramingCubeDim"]
-            f.write(struct.pack('<h', data))
-
-        # Expected binary data: int (4 bytes)
-        data = header["PosInfosVerified"]
-        f.write(struct.pack('<i', data))
-        data = header["CoordinateSystem"]
-        f.write(struct.pack('<i', data))
-
-        # Expected binary data: float (4 bytes)
-        data = header["Slice1CenterX"]
-        f.write(struct.pack('<f', data))
-        data = header["Slice1CenterY"]
-        f.write(struct.pack('<f', data))
-        data = header["Slice1CenterZ"]
-        f.write(struct.pack('<f', data))
-        data = header["SliceNCenterX"]
-        f.write(struct.pack('<f', data))
-        data = header["SliceNCenterY"]
-        f.write(struct.pack('<f', data))
-        data = header["SliceNCenterZ"]
-        f.write(struct.pack('<f', data))
-        data = header["RowDirX"]
-        f.write(struct.pack('<f', data))
-        data = header["RowDirY"]
-        f.write(struct.pack('<f', data))
-        data = header["RowDirZ"]
-        f.write(struct.pack('<f', data))
-        data = header["ColDirX"]
-        f.write(struct.pack('<f', data))
-        data = header["ColDirY"]
-        f.write(struct.pack('<f', data))
-        data = header["ColDirZ"]
-        f.write(struct.pack('<f', data))
-
-        # Expected binary data: int (4 bytes)
-        data = header["NRows"]
-        f.write(struct.pack('<i', data))
-        data = header["NCols"]
-        f.write(struct.pack('<i', data))
-
-        # Expected binary data: float (4 bytes)
-        data = header["FoVRows"]
-        f.write(struct.pack('<f', data))
-        data = header["FoVCols"]
-        f.write(struct.pack('<f', data))
-        data = header["SliceThickness"]
-        f.write(struct.pack('<f', data))
-        data = header["GapThickness"]
-        f.write(struct.pack('<f', data))
-
-        # Expected binary data: int (4 bytes)
-        data = header["NrOfPastSpatialTransformations"]
-        f.write(struct.pack('<i', data))
-
-        if header["NrOfPastSpatialTransformations"] != 0:
-            for i in range(header["NrOfPastSpatialTransformations"]):
-                # Expected binary data: variable-length string
-                data = header["PastTransformation"][i]["Name"]
-                write_variable_length_string(f, data)
-
-                # Expected binary data: int (4 bytes)
-                data = header["PastTransformation"][i]["Type"]
-                f.write(struct.pack('<i', data))
-
-                # Expected binary data: variable-length string
-                data = header["PastTransformation"][i]["SourceFileName"]
-                write_variable_length_string(f, data)
-
-                # Expected binary data: int (4 bytes)
-                data = header["PastTransformation"][i]["NrOfValues"]
-                f.write(struct.pack('<i', data))
-
-                # Transformation values are stored as a list
-                trans_values = header["PastTransformation"][i]["Values"]
-                for j in range(header["PastTransformation"][i]["NrOfValues"]):
-                    # Expected binary data: float (4 bytes)
-                    f.write(struct.pack('<f', trans_values[j]))
-
-        # Expected binary data: char (1 byte)
-        data = header["LeftRightConvention"]
-        f.write(struct.pack('<B', data))
-
-        if header["File version"] >= 4:
-            data = header["ReferenceSpaceVMR"]
-            f.write(struct.pack('<B', data))
-
-        # Expected binary data: float (4 bytes)
-        data = header["VoxelSizeX"]
-        f.write(struct.pack('<f', data))
-        data = header["VoxelSizeY"]
-        f.write(struct.pack('<f', data))
-        data = header["VoxelSizeZ"]
-        f.write(struct.pack('<f', data))
-
-        # Expected binary data: char (1 byte)
-        data = header["VoxelResolutionVerified"]
-        f.write(struct.pack('<B', data))
-        data = header["VoxelResolutionInTALmm"]
-        f.write(struct.pack('<B', data))
-
-        # Expected binary data: int (4 bytes)
-        data = header["VMROrigV16MinValue"]
-        f.write(struct.pack('<i', data))
-        data = header["VMROrigV16MeanValue"]
-        f.write(struct.pack('<i', data))
-        data = header["VMROrigV16MaxValue"]
-        f.write(struct.pack('<i', data))
-
-    return print("VMR saved.")
+    """Write BrainVoyager VMR file (legacy API)."""
+    vmr = VMR.from_legacy_dict(header, data=data_img)
+    vmr.write(filename)
+    print("VMR saved.")
 
 
 def create_vmr():
-    """Create BrainVoyager VMR file with default values."""
-    header = dict()
+    """Create BrainVoyager VMR file with default values (legacy API).
 
-    # Pre data header
-    header["File version"] = 4
-    header["DimX"] = 256
-    header["DimY"] = 256
-    header["DimZ"] = 256
-
-    # Post data header
-    header["OffsetX"] = 0
-    header["OffsetY"] = 0
-    header["OffsetZ"] = 0
-    header["FramingCubeDim"] = 256
-    header["PosInfosVerified"] = 1
-    header["CoordinateSystem"] = 0
-    header["Slice1CenterX"] = -87.5
-    header["Slice1CenterY"] = 0
-    header["Slice1CenterZ"] = 0
-    header["SliceNCenterX"] = 87.5
-    header["SliceNCenterY"] = 0
-    header["SliceNCenterZ"] = 0
-    header["RowDirX"] = 0.0
-    header["RowDirY"] = 1.0
-    header["RowDirZ"] = 0.0
-    header["ColDirX"] = 0.0
-    header["ColDirY"] = 0.0
-    header["ColDirZ"] = -1.0
-    header["NRows"] = 256
-    header["NCols"] = 256
-    header["FoVRows"] = 256.0
-    header["FoVCols"] = 256.0
-    header["SliceThickness"] = 1.0
-    header["GapThickness"] = 0.0
-    header["NrOfPastSpatialTransformations"] = 0
-    header["LeftRightConvention"] = 1
-    header["ReferenceSpaceVMR"] = 0
-    header["VoxelSizeX"] = 1.0
-    header["VoxelSizeY"] = 1.0
-    header["VoxelSizeZ"] = 1.0
-    header["VoxelResolutionVerified"] = 1
-    header["VoxelResolutionInTALmm"] = 1
-    header["VMROrigV16MinValue"] = -1
-    header["VMROrigV16MeanValue"] = -1
-    header["VMROrigV16MaxValue"] = -1
-
-    # -------------------------------------------------------------------------
-    # Create data
-    DimX = header["DimX"]
-    DimY = header["DimY"]
-    DimZ = header["DimZ"]
-    dims = [DimZ, DimY, DimX]
-    data = np.random.random(np.prod(dims)) * 225  # 225 for BV visualization
-    data = data.reshape(dims)
-    data = data.astype(np.short)
-
+    Returns (header_dict, data_ndarray).
+    """
+    vmr = VMR.create_default()
+    header = vmr.to_legacy_dict()
+    data = vmr.data
     return header, data

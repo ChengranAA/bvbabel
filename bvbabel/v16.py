@@ -1,128 +1,123 @@
-"""Read, write, create BrainVoyager V16 file format."""
+"""Read, write, create BrainVoyager V16 (16-bit anatomical) file format.
 
-import struct
+Provides a typed-object API (``V16`` class) and backward-compatible
+procedural shims (``read_v16``, ``write_v16``, ``create_v16``).
+
+Typed API
+---------
+    v16 = V16.read("anatomy.v16")
+    print(v16.dim_x, v16.data.shape, v16.data.dtype)
+    v16.write("output.v16")
+
+Procedural API (backward-compatible)
+------------------------------------
+    header, data = bvbabel.v16.read_v16("anatomy.v16")
+    bvbabel.v16.write_v16("output.v16", header, data)
+    header, data = bvbabel.v16.create_v16()
+"""
+
 import numpy as np
-from bvbabel.utils import (read_variable_length_string,
-                           write_variable_length_string)
+from bvbabel._binary_format import (
+    Field, DataField, BinaryFormat, register_format
+)
+
+
+# ---------------------------------------------------------------------------
+# Axis transforms
+# ---------------------------------------------------------------------------
+
+def _bv_to_tal(data):
+    data = np.transpose(data, (0, 2, 1))
+    data = data[::-1, ::-1, ::-1]
+    return data
+
+
+_bv_to_tal_inv = _bv_to_tal
+
+
+# ---------------------------------------------------------------------------
+# Typed V16 format
+# ---------------------------------------------------------------------------
+
+@register_format(".v16")
+class V16(BinaryFormat):
+    """Typed BrainVoyager V16 (16-bit unsigned anatomical dataset).
+
+    Unlike VMR, V16 has no file-version field, no conditional fields,
+    and no post-data header — just three dimension fields followed by
+    the raw uint16 voxel data.
+    """
+
+    dim_x = Field("<H")
+    dim_y = Field("<H")
+    dim_z = Field("<H")
+
+    data = DataField(
+        dtype="<H",
+        shape_fields=("dim_z", "dim_y", "dim_x"),
+        transform=_bv_to_tal,
+        inverse_transform=_bv_to_tal_inv,
+    )
+
+    # -- Factory ---------------------------------------------------------
+
+    @classmethod
+    def create_default(cls, dim_x=256, dim_y=256, dim_z=256):
+        v16 = cls()
+        v16.dim_x = dim_x
+        v16.dim_y = dim_y
+        v16.dim_z = dim_z
+        shape = (dim_z, dim_y, dim_x)
+        v16.data = np.random.randint(
+            0, 65535, size=shape, dtype=np.uint16
+        )
+        return v16
+
+    # -- Legacy key mapping ----------------------------------------------
+
+    _LEGACY_MAP = {
+        "dim_x": "DimX",
+        "dim_y": "DimY",
+        "dim_z": "DimZ",
+    }
+    _LEGACY_REVERSE = {v: k for k, v in _LEGACY_MAP.items()}
+
+    def to_legacy_dict(self):
+        return {
+            legacy: getattr(self, py_name)
+            for py_name, legacy in self._LEGACY_MAP.items()
+        }
+
+    @classmethod
+    def from_legacy_dict(cls, d, data=None):
+        kwargs = {}
+        for legacy_name, py_name in cls._LEGACY_REVERSE.items():
+            if legacy_name in d:
+                kwargs[py_name] = d[legacy_name]
+        instance = cls(**kwargs)
+        if data is not None:
+            instance.data = data
+        return instance
 
 
 # =============================================================================
+# Backward-compatible procedural shims
+# =============================================================================
+
 def read_v16(filename):
-    """Read BrainVoyager V16 file.
-
-    Parameters
-    ----------
-    filename : string
-        Path to file.
-
-    Returns
-    -------
-    header : dictionary
-        Pre-data and post-data headers.
-    data : 3D numpy.array
-        Image data.
-
-    """
-    header = dict()
-    with open(filename, 'rb') as f:
-        # ---------------------------------------------------------------------
-        # V16 Pre-Data Header
-        # ---------------------------------------------------------------------
-        # NOTE: V16 files contain anatomical 3D data sets,
-        # typically containing the whole brain (head) of subjects. The
-        # intensity values are stored as a series of bytes. The V16 format
-        # stores each intensity value with two bytes (short integers). The V16
-        # format contains a small header followed by the actual data. V16
-        # files do not contain a post-data header and have no file version
-
-        # Expected binary data: unsigned short int (2 bytes)
-        data, = struct.unpack('<H', f.read(2))
-        header["DimX"] = data
-        data, = struct.unpack('<H', f.read(2))
-        header["DimY"] = data
-        data, = struct.unpack('<H', f.read(2))
-        header["DimZ"] = data
-
-        # ---------------------------------------------------------------------
-        # V16 Data
-        # ---------------------------------------------------------------------
-        # NOTE(Developer Guide 2.6): Each data element (intensity value) is
-        # represented in 1 byte. The data is organized in three loops:
-        #   DimZ
-        #       DimY
-        #           DimX
-        #
-        # The axes terminology follows the internal BrainVoyager (BV) format.
-        # The mapping to Talairach axes is as follows:
-        #   BV (X front -> back) [axis 2 after np.reshape] = Y in Tal space
-        #   BV (Y top -> bottom) [axis 1 after np.reshape] = Z in Tal space
-        #   BV (Z left -> right) [axis 0 after np.reshape] = X in Tal space
-
-        # Expected binary data: unsigned short (2 bytes)
-        data_img = np.zeros((header["DimZ"] * header["DimY"] * header["DimX"]),
-                            dtype='<H')
-        data_img = np.fromfile(f, dtype='<H', count=data_img.size, sep="",
-                               offset=0)
-        data_img = np.reshape(
-            data_img, (header["DimZ"], header["DimY"], header["DimX"]))
-
-        data_img = np.transpose(data_img, (0, 2, 1))  # BV to Tal
-        data_img = data_img[::-1, ::-1, ::-1]  # Flip BV axes
-
-    return header, data_img
+    """Read BrainVoyager V16 file (legacy API)."""
+    v16 = V16.read(filename)
+    return v16.to_legacy_dict(), v16.data
 
 
-# =============================================================================
 def write_v16(filename, header, data_img):
-    """Protocol to write BrainVoyager V16 file.
-
-    Parameters
-    ----------
-    filename : string
-        Output filename.
-    header : dictionary
-        Header of V16 file (vmr headers are also accepted).
-    data_img : numpy.array, 3D
-        Image.
-
-    """
-    with open(filename, 'wb') as f:
-        # ---------------------------------------------------------------------
-        # V16 Pre-Data Header
-        # ---------------------------------------------------------------------
-        # Expected binary data: unsigned short int (2 bytes)
-        data = header["DimX"]
-        f.write(struct.pack('<H', data))
-        data = header["DimY"]
-        f.write(struct.pack('<H', data))
-        data = header["DimZ"]
-        f.write(struct.pack('<H', data))
-
-        # ---------------------------------------------------------------------
-        # V16 Data
-        # ---------------------------------------------------------------------
-        # Convert axes from Nifti standard back to BV standard
-        data_img = data_img[::-1, ::-1, ::-1]  # Flip BV axes
-        data_img = np.transpose(data_img, (0, 2, 1))  # BV to Tal
-
-        # Expected binary data: unsigned short (2 bytes)
-        f.write(data_img.astype("<H").tobytes(order="C"))
-
-    return print("V16 saved.")
+    """Write BrainVoyager V16 file (legacy API)."""
+    v16 = V16.from_legacy_dict(header, data=data_img)
+    v16.write(filename)
+    print("V16 saved.")
 
 
 def create_v16():
-    """Create BrainVoyager V16 file with default values."""
-    header = dict()
-    # Expected binary data: unsigned short int (2 bytes)
-    header["DimX"] = 256
-    header["DimY"] = 256
-    header["DimZ"] = 256
-
-    # -------------------------------------------------------------------------
-    # Create data
-    dims = [header["DimX"], header["DimY"], header["DimZ"]]
-    data = np.random.randint(0, high=65535, size=dims, dtype=np.uint16)
-    data = data.reshape(dims)
-
-    return header, data
+    """Create BrainVoyager V16 file with default values (legacy API)."""
+    v16 = V16.create_default()
+    return v16.to_legacy_dict(), v16.data

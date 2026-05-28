@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bvbabel"
+version = "0.3.0"
+description = "A lightweight Python library for reading and writing BrainVoyager file formats."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Omer Faruk Gulban", email = "gulban@brainvoyager.com" },
+]
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.17",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+
+[project.urls]
+Homepage = "https://github.com/ofgulban/bvbabel"
+Download = "https://github.com/ofgulban/bvbabel/archive/0.3.0.tar.gz"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+]
+nibabel = [
+    "nibabel>=3.2",
+]
+
+[tool.setuptools.packages.find]
+include = ["bvbabel*"]
+
+[tool.pytest.ini_options]
+testpaths = ["bvbabel/tests"]
+python_files = ["test_*.py"]
+
+[dependency-groups]
+dev = [
+    "pytest>=7",
+]
