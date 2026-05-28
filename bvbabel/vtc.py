@@ -1,310 +1,214 @@
-"""Read, write, create BrainVoyager VTC file format."""
+"""Read, write, create BrainVoyager VTC (volume time course) file format.
+
+Typed API
+---------
+    vtc = VTC.read("data.vtc")
+    print(vtc.nr_time_points, vtc.data.shape, vtc.data.dtype)
+    vtc.write("output.vtc")
+
+Procedural API (backward-compatible)
+------------------------------------
+    header, data = bvbabel.vtc.read_vtc("data.vtc")
+    bvbabel.vtc.write_vtc("output.vtc", header, data)
+    header, data = bvbabel.vtc.create_vtc()
+"""
 
 import struct
 import numpy as np
-from bvbabel.utils import read_variable_length_string
-from bvbabel.utils import write_variable_length_string
+from bvbabel._binary_format import (
+    Field, StringField, DataField, BinaryFormat, register_format,
+)
+from bvbabel.utils import read_variable_length_string, write_variable_length_string
 
 
 # =============================================================================
+# Typed VTC format
+# =============================================================================
+
+@register_format(".vtc")
+class VTC(BinaryFormat):
+    """Typed BrainVoyager VTC (4-D volume time course).
+
+    Data is always 4-D ``(Z, X, Y, T)`` in RAS-like axis order.  The
+    on-disk BV layout ``(Z, Y, X, T)`` is transposed and flipped on
+    read.
+    """
+
+    # -- Header ----------------------------------------------------------
+    file_version = Field("<h")
+    source_fmr_name = StringField()
+
+    protocol_attached = Field("<h")
+
+    # Conditional: only present when protocol_attached > 0
+    protocol_name = StringField(
+        condition=lambda s: s.protocol_attached > 0
+    )
+
+    current_protocol_index = Field("<h")
+    data_type = Field("<h")   # 1 = int16, 2 = float32
+    nr_time_points = Field("<h")
+    vtc_resolution = Field("<h")
+
+    x_start = Field("<h")
+    x_end = Field("<h")
+    y_start = Field("<h")
+    y_end = Field("<h")
+    z_start = Field("<h")
+    z_end = Field("<h")
+
+    lr_convention = Field("<B")
+    reference_space = Field("<B")
+    tr_ms = Field("<f")
+
+    # -- Data (raw bytes; dtype resolved in _post_read) ------------------
+    data = DataField(dtype="<u1", shape_fields=("_data_byte_count",))
+
+    # -- Computed --------------------------------------------------------
+
+    @property
+    def dim_x(self):
+        return (self.x_end - self.x_start) // self.vtc_resolution
+
+    @property
+    def dim_y(self):
+        return (self.y_end - self.y_start) // self.vtc_resolution
+
+    @property
+    def dim_z(self):
+        return (self.z_end - self.z_start) // self.vtc_resolution
+
+    @property
+    def _itemsize(self):
+        return 2 if self.data_type == 1 else 4
+
+    @property
+    def _data_byte_count(self):
+        return (self.dim_z * self.dim_y * self.dim_x
+                * self.nr_time_points * self._itemsize)
+
+    # -- Hooks -----------------------------------------------------------
+
+    def _post_read(self):
+        if self.data is None:
+            return
+        dt = np.dtype("<h") if self.data_type == 1 else np.dtype("<f")
+        self.data = np.frombuffer(self.data.tobytes(), dtype=dt)
+        z, y, x, t = self.dim_z, self.dim_y, self.dim_x, self.nr_time_points
+        self.data = self.data.reshape(z, y, x, t)
+        # BV (Z, Y, X, T) → RAS-like (Z, X, Y, T)
+        self.data = np.transpose(self.data, (0, 2, 1, 3))
+        self.data = self.data[::-1, ::-1, ::-1, :]
+
+    def _pre_write(self):
+        if self.data is None:
+            return
+        data = self.data[::-1, ::-1, ::-1, :]
+        data = np.transpose(data, (0, 2, 1, 3))
+        self.data = data.ravel().view("<u1")
+
+    # -- Factory ---------------------------------------------------------
+
+    @classmethod
+    def create_default(cls, dim_x=120, dim_y=100, dim_z=80, nr_time_points=10):
+        vtc = cls()
+        vtc.file_version = 3
+        vtc.source_fmr_name = ""
+        vtc.protocol_attached = 0
+        vtc.current_protocol_index = 0
+        vtc.data_type = 1          # int16
+        vtc.nr_time_points = nr_time_points
+        vtc.vtc_resolution = 1
+        vtc.x_start = 90
+        vtc.x_end = 90 + dim_x
+        vtc.y_start = 100
+        vtc.y_end = 100 + dim_y
+        vtc.z_start = 110
+        vtc.z_end = 110 + dim_z
+        vtc.lr_convention = 1
+        vtc.reference_space = 1
+        vtc.tr_ms = 1000.0
+        # Logical shape: (Z, X, Y, T)
+        vtc.data = (np.random.random(
+            (dim_z, dim_x, dim_y, nr_time_points)) * 225
+        ).astype(np.int16)
+        return vtc
+
+    # -- Legacy key mapping ----------------------------------------------
+
+    _LEGACY_MAP = {
+        "file_version": "File version",
+        "source_fmr_name": "Source FMR name",
+        "protocol_attached": "Protocol attached",
+        "protocol_name": "Protocol name",
+        "current_protocol_index": "Current protocol index",
+        "data_type": "Data type (1:short int, 2:float)",
+        "nr_time_points": "Nr time points",
+        "vtc_resolution": "VTC resolution relative to VMR (1, 2, or 3)",
+        "x_start": "XStart",
+        "x_end": "XEnd",
+        "y_start": "YStart",
+        "y_end": "YEnd",
+        "z_start": "ZStart",
+        "z_end": "ZEnd",
+        "lr_convention": "L-R convention (0:unknown, 1:radiological, 2:neurological)",
+        "reference_space": "Reference space (0:unknown, 1:native, 2:ACPC, 3:Tal, 4:MNI)",
+        "tr_ms": "TR (ms)",
+    }
+    _LEGACY_REVERSE = {v: k for k, v in _LEGACY_MAP.items()}
+
+    def to_legacy_dict(self):
+        result = {}
+        for py_name, legacy_name in self._LEGACY_MAP.items():
+            val = getattr(self, py_name)
+            # Only include protocol_name if it was actually present
+            if py_name == "protocol_name" and self.protocol_attached == 0:
+                result[legacy_name] = ""
+            else:
+                result[legacy_name] = val
+        return result
+
+    @classmethod
+    def from_legacy_dict(cls, d, data=None):
+        kwargs = {}
+        for legacy_name, py_name in cls._LEGACY_REVERSE.items():
+            if legacy_name in d:
+                kwargs[py_name] = d[legacy_name]
+        # protocol_name: always set from dict (even empty string)
+        if "Protocol name" in d:
+            kwargs["protocol_name"] = d["Protocol name"]
+        instance = cls(**kwargs)
+        if data is not None:
+            instance.data = data
+        return instance
+
+
+# =============================================================================
+# Backward-compatible shims
+# =============================================================================
+
 def read_vtc(filename, rearrange_data_axes=True):
-    """Read BrainVoyager VTC file.
+    """Read BrainVoyager VTC file (legacy API).
 
-    Parameters
-    ----------
-    filename : string
-        Path to file.
-    rearrange_data_axes : bool
-        When 'False', axes are intended to follow LIP+ terminology used
-        internally in BrainVoyager (however see the notes below):
-            - 1st axis is Right to "L"eft.
-            - 2nd axis is Superior to "I"nferior.
-            - 3rd axis is Anterior to "P"osterior.
-        When 'True' axes are intended to follow nibabel RAS+ terminology:
-            - 1st axis is Left to "R"ight.
-            - 2nd axis is Posterior to "A"nterior.
-            - 3rd axis is Inferior to "S"uperior.
-
-    Returns
-    -------
-    header : dictionary
-        Pre-data and post-data headers.
-    data : 3D numpy.array
-        Image data.
-
-    Notes
-    -----
-    - Based on several vtc inputs that are converted to nifti with RAS+ axes,
-    I have concluded that the internal BrainVoyager axes are LIP+. However,
-    this does not reflect the BrainVoyager VTC file documentation (Users Guide
-    v2.3), in which the axes are described to be PIR+.
-    - TODO[Faruk]: Revise the note below.
-    Note that `ZStart - ZEnd` indicates the 1st data axis in the internal
-    BrainVoyager PIR+ terminology. However `ZStart - ZEnd` indicates the
-    3rd axis in RAS terminology. Time is in the 4th axis in both cases.
-
-
+    The *rearrange_data_axes* flag is accepted for backward compatibility
+    but has no effect — the typed API always returns RAS-like axes.
     """
-    header = dict()
-    with open(filename, 'rb') as f:
-        # Expected binary data: short int (2 bytes)
-        data, = struct.unpack('<h', f.read(2))
-        header["File version"] = data
-
-        # Expected binary data: variable-length string
-        data = read_variable_length_string(f)
-        header["Source FMR name"] = data
-
-        # Expected binary data: short int (2 bytes)
-        data, = struct.unpack('<h', f.read(2))
-        header["Protocol attached"] = data
-
-        if header["Protocol attached"] > 0:
-            # Expected binary data: variable-length string
-            data = read_variable_length_string(f)
-            header["Protocol name"] = data
-        else:
-            header["Protocol name"] = ""
-
-        # Expected binary data: short int (2 bytes)
-        data, = struct.unpack('<h', f.read(2))
-        header["Current protocol index"] = data
-        data, = struct.unpack('<h', f.read(2))
-        header["Data type (1:short int, 2:float)"] = data
-        data, = struct.unpack('<h', f.read(2))
-        header["Nr time points"] = data
-        data, = struct.unpack('<h', f.read(2))
-        header["VTC resolution relative to VMR (1, 2, or 3)"] = data
-
-        data, = struct.unpack('<h', f.read(2))
-        header["XStart"] = data
-        data, = struct.unpack('<h', f.read(2))
-        header["XEnd"] = data
-        data, = struct.unpack('<h', f.read(2))
-        header["YStart"] = data
-        data, = struct.unpack('<h', f.read(2))
-        header["YEnd"] = data
-        data, = struct.unpack('<h', f.read(2))
-        header["ZStart"] = data
-        data, = struct.unpack('<h', f.read(2))
-        header["ZEnd"] = data
-
-        # Expected binary data: char (1 byte)
-        data, = struct.unpack('<B', f.read(1))
-        header["L-R convention (0:unknown, 1:radiological, 2:neurological)"] = data
-        data, = struct.unpack('<B', f.read(1))
-        header["Reference space (0:unknown, 1:native, 2:ACPC, 3:Tal, 4:MNI)"] = data
-
-        # Expected binary data: char (4 bytes)
-        data, = struct.unpack('<f', f.read(4))
-        header["TR (ms)"] = data
-
-        # ---------------------------------------------------------------------
-        # Read VTC data
-        # ---------------------------------------------------------------------
-        # NOTE(Users Guide 2.3): Each data element (intensity value) is
-        # represented in 2 bytes (unsigned short) or 4 bytes (float) as
-        # specified in "data type" entry. The data is organized in four loops:
-        #   DimZ
-        #       DimY
-        #           DimX
-        #               DimT
-        #
-        # The axes terminology follows the internal BrainVoyager (BV) format.
-        # The mapping to Talairach axes is as follows:
-        #   BV (X front -> back) [axis 2 after np.reshape] = Y in Tal space
-        #   BV (Y top -> bottom) [axis 1 after np.reshape] = Z in Tal space
-        #   BV (Z left -> right) [axis 0 after np.reshape] = X in Tal space
-
-        # Prepare dimensions of VTC data array
-        VTC_resolution = header["VTC resolution relative to VMR (1, 2, or 3)"]
-        DimX = (header["XEnd"] - header["XStart"]) // VTC_resolution
-        DimY = (header["YEnd"] - header["YStart"]) // VTC_resolution
-        DimZ = (header["ZEnd"] - header["ZStart"]) // VTC_resolution
-        DimT = header["Nr time points"]
-
-        data_img = np.zeros(DimZ * DimY * DimX * DimT)
-
-        if header["Data type (1:short int, 2:float)"] == 1:
-            data_img = np.fromfile(f, dtype='<h', count=data_img.size, sep="",
-                                   offset=0)
-        elif header["Data type (1:short int, 2:float)"] == 2:
-            data_img = np.fromfile(f, dtype='<f', count=data_img.size, sep="",
-                                   offset=0)
-        else:
-            raise ("Unrecognized VTC data_img type.")
-
-        data_img = np.reshape(data_img, (DimZ, DimY, DimX, DimT))
-
-        # TODO[Faruk]: I need to triple check this part with various data
-        if rearrange_data_axes is True:
-            # TODO[Faruk] PIR+ to RAS+ ? I am not sure
-            data_img = np.transpose(data_img, (0, 2, 1, 3))
-            data_img = data_img[::-1, ::-1, ::-1, :]
-
-    return header, data_img
+    vtc = VTC.read(filename)
+    return vtc.to_legacy_dict(), vtc.data
 
 
-# =============================================================================
 def write_vtc(filename, header, data_img, rearrange_data_axes=True):
-    """Protocol to write BrainVoyager VTC file.
+    """Write BrainVoyager VTC file (legacy API).
 
-    Parameters
-    ----------
-    filename : string
-        Path to file.
-    header : dictionary
-        Pre-data and post-data headers.
-    data_img : 3D numpy.array
-        Image data.
-    rearrange_data_axes : bool
-        When 'False', axes are intended to follow LIP+ terminology used
-        internally in BrainVoyager (however see the notes below):
-            - 1st axis is Right to "L"eft.
-            - 2nd axis is Superior to "I"nferior.
-            - 3rd axis is Anterior to "P"osterior.
-        When 'True' axes are intended to follow nibabel RAS+ terminology:
-            - 1st axis is Left to "R"ight.
-            - 2nd axis is Posterior to "A"nterior.
-            - 3rd axis is Inferior to "S"uperior.
-
+    The *rearrange_data_axes* flag is accepted for backward compatibility
+    but the data is always assumed to be in RAS-like ``(Z, X, Y, T)``
+    layout (the output of ``read_vtc``).
     """
-    with open(filename, 'wb') as f:
-        # Expected binary data: short int (2 bytes)
-        data = header["File version"]
-        f.write(struct.pack('<h', data))
-
-        # Expected binary data: variable-length string
-        data = header["Source FMR name"]
-        write_variable_length_string(f, data)
-
-        # Expected binary data: short int (2 bytes)
-        data = header["Protocol attached"]
-        f.write(struct.pack('<h', data))
-
-        if header["Protocol attached"] > 0:
-            # Expected binary data: variable-length string
-            data = header["Protocol name"]
-            write_variable_length_string(f, data)
-
-        # Expected binary data: short int (2 bytes)
-        data = header["Current protocol index"]
-        f.write(struct.pack('<h', data))
-        data = header["Data type (1:short int, 2:float)"]
-        f.write(struct.pack('<h', data))
-        data = header["Nr time points"]
-        f.write(struct.pack('<h', data))
-        data = header["VTC resolution relative to VMR (1, 2, or 3)"]
-        f.write(struct.pack('<h', data))
-
-        data = header["XStart"]
-        f.write(struct.pack('<h', data))
-        data = header["XEnd"]
-        f.write(struct.pack('<h', data))
-        data = header["YStart"]
-        f.write(struct.pack('<h', data))
-        data = header["YEnd"]
-        f.write(struct.pack('<h', data))
-        data = header["ZStart"]
-        f.write(struct.pack('<h', data))
-        data = header["ZEnd"]
-        f.write(struct.pack('<h', data))
-
-        # Expected binary data: char (1 byte)
-        data = header["L-R convention (0:unknown, 1:radiological, 2:neurological)"]
-        f.write(struct.pack('<B', data))
-        data = header["Reference space (0:unknown, 1:native, 2:ACPC, 3:Tal, 4:MNI)"]
-        f.write(struct.pack('<B', data))
-
-        # Expected binary data: char (4 bytes)
-        data = header["TR (ms)"]
-        f.write(struct.pack('<f', data))
-
-        # ---------------------------------------------------------------------
-        # Write VTC data
-        # ---------------------------------------------------------------------
-        if rearrange_data_axes is True:
-            data_img = data_img[::-1, ::-1, ::-1, :]
-            data_img = np.transpose(data_img, (0, 2, 1, 3))
-
-        data_img = np.reshape(data_img, data_img.size)
-
-        if header["Data type (1:short int, 2:float)"] == 1:
-            dtype = np.dtype("<h")
-        elif header["Data type (1:short int, 2:float)"] == 2:
-            dtype = np.dtype("<f")
-        else:
-            raise ("Unrecognized VTC data_img type.")
-
-        data_img.astype(dtype, copy=False).ravel(order="C").tofile(f)
+    vtc = VTC.from_legacy_dict(header, data=data_img)
+    vtc.write(filename)
 
 
 def create_vtc(rearrange_data_axes=True):
-    """Create BrainVoyager VTC file with default values.
-
-    Parameters
-    ----------
-    rearrange_data_axes : bool
-        When 'False', axes are intended to follow LIP+ terminology used
-        internally in BrainVoyager (however see the notes below):
-            - 1st axis is Right to "L"eft.
-            - 2nd axis is Superior to "I"nferior.
-            - 3rd axis is Anterior to "P"osterior.
-        When 'True' axes are intended to follow nibabel RAS+ terminology:
-            - 1st axis is Left to "R"ight.
-            - 2nd axis is Posterior to "A"nterior.
-            - 3rd axis is Inferior to "S"uperior.
-
-    """
-    header = dict()
-    # Expected binary data: short int (2 bytes)
-    header["File version"] = 3
-
-    # Expected binary data: variable-length string
-    header["Source FMR name"] = ""
-
-    # Expected binary data: short int (2 bytes)
-    header["Protocol attached"] = 0
-
-    # if header["Protocol attached"] > 0:
-    #     # Expected binary data: variable-length string
-    #     data = header["Protocol name"]
-    #     write_variable_length_string(f, data)
-
-    # Expected binary data: short int (2 bytes)
-    header["Current protocol index"] = 0
-
-    # NOTE: float vtc does not seem to work in BV so I make it short int
-    header["Data type (1:short int, 2:float)"] = 1
-    header["Nr time points"] = 10
-    header["VTC resolution relative to VMR (1, 2, or 3)"] = 1
-
-    header["XStart"] = 90
-    header["XEnd"] = 210
-    header["YStart"] = 100
-    header["YEnd"] = 200
-    header["ZStart"] = 110
-    header["ZEnd"] = 190
-
-    # Expected binary data: char (1 byte)
-    header["L-R convention (0:unknown, 1:radiological, 2:neurological)"] = 1
-    header["Reference space (0:unknown, 1:native, 2:ACPC, 3:Tal, 4:MNI)"] = 1
-
-    # Expected binary data: char (4 bytes)
-    header["TR (ms)"] = 1000
-
-    # -------------------------------------------------------------------------
-    # Create data
-    DimX = header["XEnd"] - header["XStart"]
-    DimY = header["YEnd"] - header["YStart"]
-    DimZ = header["ZEnd"] - header["ZStart"]
-    DimT = header["Nr time points"]
-    if rearrange_data_axes is True:
-        dims = [DimX, DimY, DimZ, DimT]
-    else:
-        dims = [DimZ, DimY, DimX, DimT]
-    data = np.random.random(np.prod(dims)) * 225  # 225 for BV visualization
-    data = data.reshape(dims)
-    data = data.astype(np.short)  # NOTE: float vtc does not seem to work in BV
-
-    return header, data
+    """Create BrainVoyager VTC file with default values (legacy API)."""
+    vtc = VTC.create_default()
+    return vtc.to_legacy_dict(), vtc.data

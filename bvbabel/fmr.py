@@ -1,569 +1,750 @@
-"""Read, write, create BrainVoyager FMR file format."""
+"""Read, write, create BrainVoyager FMR (functional MR) file format.
+
+FMR is a text header file paired with a binary STC data file.  This
+module provides a typed-object API (``FMR`` class) and backward-
+compatible procedural shims.
+
+Typed API
+---------
+    fmr = FMR.read("project.fmr")
+    print(fmr.nr_of_volumes, fmr.data.shape)
+    print(fmr.position.slice_1_center_x)
+    fmr.write("output.fmr")
+
+    # Header-only (no STC data loaded)
+    meta = FMR.read("project.fmr", load_data=False)
+"""
 
 import os
 import numpy as np
+from bvbabel._binary_format import (
+    Field, DataField, ObjectField, Section, BinaryFormat, register_format,
+)
 from bvbabel.stc import read_stc, write_stc
 
 
 # =============================================================================
-def read_fmr(filename, rearrange_data_axes=True):
-    """Read BrainVoyager FMR (and the paired STC) file.
+# Section sub-objects
+# =============================================================================
 
-    Parameters
-    ----------
-    filename : string
-        Path to file.
+class FmrPositionInfo(Section):
+    """Slice position / orientation information."""
 
-    Returns
-    -------
-    header : dictionary
-        Pre-data and post-data headers.
-    data : 4D numpy.array, (x, y, slices, time)
-        Image data.
-    rearrange_data_axes : bool
-        When 'False', axes are intended to follow LIP+ terminology used
-        internally in BrainVoyager (however see the notes below):
-            - 1st axis is Right to "L"eft.
-            - 2nd axis is Superior to "I"nferior.
-            - 3rd axis is Anterior to "P"osterior.
-        When 'True' axes are intended to follow nibabel RAS+ terminology:
-            - 1st axis is Left to "R"ight.
-            - 2nd axis is Posterior to "A"nterior.
-            - 3rd axis is Inferior to "S"uperior.
+    pos_infos_verified = Field()
+    coordinate_system = Field()
+    slice_1_center_x = Field()
+    slice_1_center_y = Field()
+    slice_1_center_z = Field()
+    slice_n_center_x = Field()
+    slice_n_center_y = Field()
+    slice_n_center_z = Field()
+    row_dir_x = Field()
+    row_dir_y = Field()
+    row_dir_z = Field()
+    col_dir_x = Field()
+    col_dir_y = Field()
+    col_dir_z = Field()
+    n_rows = Field()
+    n_cols = Field()
+    fov_rows = Field()
+    fov_cols = Field()
+    slice_thickness = Field()
+    gap_thickness = Field()
 
-    """
-    header = dict()
-    info_pos = dict()
-    info_tra = dict()
-    info_multiband = dict()
-    slice_thickness_count = 0
 
-    with open(filename, 'r') as f:
-        lines = f.readlines()
-        for j in range(0, len(lines)):
-            line = lines[j]
-            content = line.strip()
-            content = content.split(":", 1)
-            content = [i.strip() for i in content]
+class FmrTransformInfo(Section):
+    """Spatial transformation records."""
 
-            # -----------------------------------------------------------------
-            # NOTE[Faruk]: Quickly skip entries starting with number. This is
-            # because such entries belong to other structures and are dealth
-            # with below in transformations and multiband sections
-            if content[0].isdigit():
-                pass
-            elif content[0] == "FileVersion":
-                header[content[0]] = content[1]
-            elif content[0] == "NrOfVolumes":
-                header[content[0]] = int(content[1])
-            elif content[0] == "NrOfSlices":
-                header[content[0]] = int(content[1])
-            elif content[0] == "NrOfSkippedVolumes":
-                header[content[0]] = content[1]
-            elif content[0] == "Prefix":
-                header[content[0]] = content[1].strip("\"")
+    nr_of_past_spatial_transformations = Field(default=0)
+    name_of_spatial_transformation = Field(default="")
+    type_of_spatial_transformation = Field(default="")
+    applied_to_file_name = Field(default="")
+    nr_of_transformation_values = Field(default="")
+    transformation_matrix = Field(default=None)
 
-            # NOTE(Developer Guide 2.6): The "DataStorageFormat" entry was 
-            # introduced in file version "5". A value of "1" indicates that the 
-            # STC data is stored according to the old approach with one
-            # separate file per slice. A value of "2" indicates that the whole 
-            # data is stored in a single STC file; the data within the file is 
-            # stored in the same way as in the old style. Values "3" and "4" 
-            # are used at present only for DMR-DWI projects. Storage format "3" 
-            # keeps the data not as "slice time courses", but as a series of 
-            # volumes within a single file. Storage format "4" stores the data 
-            # in the form of VTCs, i.e. the time course values for a voxel are 
-            # located in neighboring memory locations (time as inner loop).
-            elif content[0] == "DataStorageFormat":
-                header[content[0]] = int(content[1])
-            elif content[0] == "DataType":  # 1: 2-byte int; 2:4-byte float 
-                header[content[0]] = int(content[1])
-            
-            elif content[0] == "TR":
-                header[content[0]] = content[1]
-            elif content[0] == "InterSliceTime":
-                header[content[0]] = content[1]
-            elif content[0] == "TimeResolutionVerified":
-                header[content[0]] = content[1]
-            elif content[0] == "TE":
-                header[content[0]] = content[1]
-            elif content[0] == "SliceAcquisitionOrder":
-                header[content[0]] = content[1]
-            elif content[0] == "SliceAcquisitionOrderVerified":
-                header[content[0]] = content[1]
-            elif content[0] == "ResolutionX":
-                header[content[0]] = int(content[1])
-            elif content[0] == "NrOfColumns":
-                content[0] = "ResolutionX"
-                header[content[0]] = int(content[1])
-            elif content[0] == "ResolutionY":
-                header[content[0]] = int(content[1])
-            elif content[0] == "NrOfRows":
-                content[0] = "ResolutionY"
-                header[content[0]] = int(content[1])
-            elif content[0] == "LoadAMRFile":
-                header[content[0]] = content[1].strip("\"")
-            elif content[0] == "ShowAMRFile":
-                header[content[0]] = content[1]
-            elif content[0] == "ImageIndex":
-                header[content[0]] = content[1]
-            elif content[0] == "LayoutNColumns":
-                header[content[0]] = content[1]
-            elif content[0] == "LayoutNRows":
-                header[content[0]] = content[1]
-            elif content[0] == "LayoutZoomLevel":
-                header[content[0]] = content[1]
-            elif content[0] == "SegmentSize":
-                header[content[0]] = content[1]
-            elif content[0] == "SegmentOffset":
-                header[content[0]] = content[1]
-            elif content[0] == "NrOfLinkedProtocols":
-                header[content[0]] = content[1]
-            elif content[0] == "ProtocolFile":
-                header[content[0]] = content[1].strip("\"")
-            elif content[0] == "InplaneResolutionX":
-                header[content[0]] = content[1]
-            elif content[0] == "InplaneResolutionY":
-                header[content[0]] = content[1]
-            elif content[0] == "SliceThickness" and slice_thickness_count == 0:
-                header[content[0]] = content[1]
-                slice_thickness_count +=1
-                # NOTE: This is duplicate entry that appears in position
-                # information header too. However the position information header
-                # is not filled when creating an FMR file from a NIfTI file
-                # that has been created outside of BrainVoyager.
-            elif content[0] == "SliceGap":
-                header[content[0]] = content[1]
-            elif content[0] == "VoxelResolutionVerified":
-                header[content[0]] = content[1]
 
-            # -----------------------------------------------------------------
-            # Position information
-            elif content[0] == "PositionInformationFromImageHeaders":
-                pass  # No info to be stored here
-            elif content[0] == "PosInfosVerified":
-                info_pos[content[0]] = content[1]
-            elif content[0] == "CoordinateSystem":
-                info_pos[content[0]] = content[1]
-            elif content[0] == "Slice1CenterX":
-                info_pos[content[0]] = content[1]
-            elif content[0] == "Slice1CenterY":
-                info_pos[content[0]] = content[1]
-            elif content[0] == "Slice1CenterZ":
-                info_pos[content[0]] = content[1]
-            elif content[0] == "SliceNCenterX":
-                info_pos[content[0]] = content[1]
-            elif content[0] == "SliceNCenterY":
-                info_pos[content[0]] = content[1]
-            elif content[0] == "SliceNCenterZ":
-                info_pos[content[0]] = content[1]
-            elif content[0] == "RowDirX":
-                info_pos[content[0]] = content[1]
-            elif content[0] == "RowDirY":
-                info_pos[content[0]] = content[1]
-            elif content[0] == "RowDirZ":
-                info_pos[content[0]] = content[1]
-            elif content[0] == "ColDirX":
-                info_pos[content[0]] = content[1]
-            elif content[0] == "ColDirY":
-                info_pos[content[0]] = content[1]
-            elif content[0] == "ColDirZ":
-                info_pos[content[0]] = content[1]
-            elif content[0] == "NRows":
-                info_pos[content[0]] = content[1]
-            elif content[0] == "NCols":
-                info_pos[content[0]] = content[1]
-            elif content[0] == "FoVRows":
-                info_pos[content[0]] = content[1]
-            elif content[0] == "FoVCols":
-                info_pos[content[0]] = content[1]
-            elif content[0] == "SliceThickness":
-                # NOTE[Faruk]: This is duplicate entry that appears twice.
-                # ee header['SliceThickness'] section above.
-                info_pos[content[0]] = content[1]
-            elif content[0] == "GapThickness":
-                info_pos[content[0]] = content[1]
+class FmrMultibandInfo(Section):
+    """Multiband acquisition parameters."""
 
-            # -----------------------------------------------------------------
-            # Transformations section
-            elif content[0] == "NrOfPastSpatialTransformations":
-                info_tra[content[0]] = int(content[1])
-            elif content[0] == "NameOfSpatialTransformation":
-                info_tra[content[0]] = content[1]
-            elif content[0] == "TypeOfSpatialTransformation":
-                info_tra[content[0]] = content[1]
-            elif content[0] == "AppliedToFileName":
-                info_tra[content[0]] = content[1]
-            elif content[0] == "NrOfTransformationValues":
-                info_tra[content[0]] = content[1]
-
-                # NOTE(Faruk): I dont like this matrix reader but I don't see a
-                # more elegant way for now.
-                nr_values = int(content[1])
-                affine = []
-                v = 0  # Counter for values
-                n = 1  # Counter for lines
-                while v < nr_values:
-                    line = lines[j + n]
-                    content = line.strip()
-                    content = content.split()
-                    for val in content:
-                        affine.append(float(val))
-                    v += len(content)  # Count values
-                    n += 1  # Iterate line
-                affine = np.reshape(np.asarray(affine), (4, 4))
-                info_tra["Transformation matrix"] = affine
-
-            # -----------------------------------------------------------------
-            # This part only contains a single information
-            elif content[0] == "LeftRightConvention":
-                header[content[0]] = content[1]
-
-            # -----------------------------------------------------------------
-            # Multiband section
-            elif content[0] == "FirstDataSourceFile":
-                info_multiband[content[0]] = content[1]
-            elif content[0] == "MultibandSequence":
-                info_multiband[content[0]] = content[1]
-            elif content[0] == "MultibandFactor":
-                info_multiband[content[0]] = content[1]
-            elif content[0] == "SliceTimingTableSize":
-                info_multiband[content[0]] = int(content[1])
-
-                # NOTE(Faruk): I dont like this matrix reader but I don't see a
-                # more elegant way for now.
-                nr_values = int(content[1])
-                slice_timings = []
-                for n in range(1, nr_values+1):
-                    line = lines[j + n]
-                    content = line.strip()
-                    slice_timings.append(float(content))
-                info_multiband["Slice timings"] = slice_timings
-
-            elif content[0] == "AcqusitionTime":
-                info_multiband[content[0]] = content[1]
-
-    header["Position information"] = info_pos
-    header["Transformation information"] = info_tra
-    header["Multiband information"] = info_multiband
-
-    # -------------------------------------------------------------------------
-    # Access data from the separate STC file
-    dirname = os.path.dirname(filename)
-    filename_stc = os.path.join(dirname, "{}.stc".format(header["Prefix"]))
-
-    data_img = read_stc(filename_stc, nr_slices=header["NrOfSlices"],
-                        nr_volumes=header["NrOfVolumes"],
-                        res_x=header["ResolutionX"],
-                        res_y=header["ResolutionY"],
-                        data_type=header["DataType"],
-                        rearrange_data_axes=rearrange_data_axes)
-
-    return header, data_img
+    first_data_source_file = Field(default="")
+    multiband_sequence = Field(default="")
+    multiband_factor = Field(default="")
+    slice_timing_table_size = Field(default=0)
+    slice_timings = Field(default=None)
+    acquisition_time = Field(default="")
 
 
 # =============================================================================
-def write_fmr(filename, header, data_img, rearrange_data_axes=True):
-    """Protocol to write BrainVoyager FMR (and the paired STC) file.
+# FMR format
+# =============================================================================
 
-    Parameters
-    ----------
-    filename : string
-        Path to file.
-    header : dictionary
-        Information that will be written into FMR file.
-    data_img : 4D numpy.array, (x, y, slices, time)
-        Image data.
-    rearrange_data_axes : bool
-        When 'False', axes are intended to follow LIP+ terminology used
-        internally in BrainVoyager (however see the notes below):
-            - 1st axis is Right to "L"eft.
-            - 2nd axis is Superior to "I"nferior.
-            - 3rd axis is Anterior to "P"osterior.
-        When 'True' axes are intended to follow nibabel RAS+ terminology:
-            - 1st axis is Left to "R"ight.
-            - 2nd axis is Posterior to "A"nterior.
-            - 3rd axis is Inferior to "S"uperior.
+@register_format(".fmr")
+class FMR(BinaryFormat):
+    """Typed BrainVoyager FMR (functional MR dataset).
 
+    The header is stored as a text ``.fmr`` file; the 4-D voxel data is
+    stored in a paired ``.stc`` binary file.  Data is always
+    ``(Z, X, Y, T)`` in RAS-like axis order.
     """
-    info_pos = header["Position information"]
-    info_tra = header["Transformation information"]
-    info_multiband = header["Multiband information"]
-    basepath = filename.split(os.extsep, 1)[0]
-    basename = os.path.basename(basepath)
 
-    with open(filename, 'w') as f:
-        f.write("\n")
+    # -- Main header fields ----------------------------------------------
+    file_version = Field(default="")
+    nr_of_volumes = Field(default=0)
+    nr_of_slices = Field(default=0)
+    nr_of_skipped_volumes = Field(default="")
+    prefix = Field(default="")
+    data_storage_format = Field(default=0)
+    data_type = Field(default=0)          # 1=int16, 2=float32
+    tr = Field(default="")
+    inter_slice_time = Field(default="")
+    time_resolution_verified = Field(default="")
+    te = Field(default="")
+    slice_acquisition_order = Field(default="")
+    slice_acquisition_order_verified = Field(default="")
+    resolution_x = Field(default=0)
+    resolution_y = Field(default=0)
+    load_amr_file = Field(default="")
+    show_amr_file = Field(default="")
+    image_index = Field(default="")
+    layout_n_columns = Field(default="")
+    layout_n_rows = Field(default="")
+    layout_zoom_level = Field(default="")
+    segment_size = Field(default="")
+    segment_offset = Field(default="")
+    nr_of_linked_protocols = Field(default="")
+    protocol_file = Field(default="")
+    inplane_resolution_x = Field(default="")
+    inplane_resolution_y = Field(default="")
+    slice_thickness = Field(default="")
+    slice_gap = Field(default="")
+    voxel_resolution_verified = Field(default="")
+    left_right_convention = Field(default="")
 
-        data = header["FileVersion"]
-        f.write("FileVersion:                   {}\n".format(data))
-        data = header["NrOfVolumes"]
-        f.write("NrOfVolumes:                   {}\n".format(data))
-        data = header["NrOfSlices"]
-        f.write("NrOfSlices:                    {}\n".format(data))
-        data = header["NrOfSkippedVolumes"]
-        f.write("NrOfSkippedVolumes:            {}\n".format(data))
-        data = basename  # NOTE: This is updated to new filename.
-        f.write("Prefix:                        \"{}\"\n".format(data))
-        data = header["DataStorageFormat"]
-        f.write("DataStorageFormat:             {}\n".format(data))
-        data = header["DataType"]
-        f.write("DataType:                      {}\n".format(data))
-        data = header["TR"]
-        f.write("TR:                            {}\n".format(data))
-        data = header["InterSliceTime"]
-        f.write("InterSliceTime:                {}\n".format(data))
-        data = header["TimeResolutionVerified"]
-        f.write("TimeResolutionVerified:        {}\n".format(data))
-        data = header["TE"]
-        f.write("TE:                            {}\n".format(data))
-        data = header["SliceAcquisitionOrder"]
-        f.write("SliceAcquisitionOrder:         {}\n".format(data))
-        data = header["SliceAcquisitionOrderVerified"]
-        f.write("SliceAcquisitionOrderVerified: {}\n".format(data))
-        data = header["ResolutionX"]
-        f.write("ResolutionX:                   {}\n".format(data))
-        data = header["ResolutionY"]
-        f.write("ResolutionY:                   {}\n".format(data))
-        if "LoadAMRFile" in header:
-            data = header["LoadAMRFile"]
+    # -- Sub-objects (populated by parsing, skipped by binary loop) ------
+    position = ObjectField(default_factory=FmrPositionInfo)
+    transform = ObjectField(default_factory=FmrTransformInfo)
+    multiband = ObjectField(default_factory=FmrMultibandInfo)
+
+    # -- I/O: override for text parsing ----------------------------------
+
+    @classmethod
+    def read(cls, filename, load_data=True):
+        instance = cls()
+
+        # --- Parse text header ---
+        info_pos = {}
+        info_tra = {}
+        info_multiband = {}
+        slice_thickness_count = 0
+        header_raw = {}  # raw string values from file
+
+        with open(filename, "r") as f:
+            lines = f.readlines()
+
+        j = 0
+        while j < len(lines):
+            line = lines[j]
+            line = line.strip()
+            if not line:
+                j += 1
+                continue
+
+            parts = line.split(":", 1)
+            key = parts[0].strip()
+
+            if len(parts) < 2:
+                j += 1
+                continue
+            value = parts[1].strip()
+
+            # Skip numeric-only keys (transformation/multiband data rows)
+            if key.isdigit():
+                j += 1
+                continue
+
+            # --- Main header ---
+            if key == "FileVersion":
+                instance.file_version = value
+            elif key == "NrOfVolumes":
+                instance.nr_of_volumes = int(value)
+            elif key == "NrOfSlices":
+                instance.nr_of_slices = int(value)
+            elif key == "NrOfSkippedVolumes":
+                instance.nr_of_skipped_volumes = value
+            elif key == "Prefix":
+                instance.prefix = value.strip('"')
+            elif key == "DataStorageFormat":
+                instance.data_storage_format = int(value)
+            elif key == "DataType":
+                instance.data_type = int(value)
+            elif key == "TR":
+                instance.tr = value
+            elif key == "InterSliceTime":
+                instance.inter_slice_time = value
+            elif key == "TimeResolutionVerified":
+                instance.time_resolution_verified = value
+            elif key == "TE":
+                instance.te = value
+            elif key == "SliceAcquisitionOrder":
+                instance.slice_acquisition_order = value
+            elif key == "SliceAcquisitionOrderVerified":
+                instance.slice_acquisition_order_verified = value
+            elif key in ("ResolutionX", "NrOfColumns"):
+                instance.resolution_x = int(value)
+            elif key in ("ResolutionY", "NrOfRows"):
+                instance.resolution_y = int(value)
+            elif key == "LoadAMRFile":
+                instance.load_amr_file = value.strip('"')
+            elif key == "ShowAMRFile":
+                instance.show_amr_file = value
+            elif key == "ImageIndex":
+                instance.image_index = value
+            elif key == "LayoutNColumns":
+                instance.layout_n_columns = value
+            elif key == "LayoutNRows":
+                instance.layout_n_rows = value
+            elif key == "LayoutZoomLevel":
+                instance.layout_zoom_level = value
+            elif key == "SegmentSize":
+                instance.segment_size = value
+            elif key == "SegmentOffset":
+                instance.segment_offset = value
+            elif key == "NrOfLinkedProtocols":
+                instance.nr_of_linked_protocols = value
+            elif key == "ProtocolFile":
+                instance.protocol_file = value.strip('"')
+            elif key == "InplaneResolutionX":
+                instance.inplane_resolution_x = value
+            elif key == "InplaneResolutionY":
+                instance.inplane_resolution_y = value
+            elif key == "SliceThickness" and slice_thickness_count == 0:
+                instance.slice_thickness = value
+                slice_thickness_count += 1
+            elif key == "SliceGap":
+                instance.slice_gap = value
+            elif key == "VoxelResolutionVerified":
+                instance.voxel_resolution_verified = value
+
+            # --- Position information ---
+            elif key == "PosInfosVerified":
+                info_pos[key] = value
+            elif key == "CoordinateSystem":
+                info_pos[key] = value
+            elif key == "Slice1CenterX":
+                info_pos[key] = value
+            elif key == "Slice1CenterY":
+                info_pos[key] = value
+            elif key == "Slice1CenterZ":
+                info_pos[key] = value
+            elif key == "SliceNCenterX":
+                info_pos[key] = value
+            elif key == "SliceNCenterY":
+                info_pos[key] = value
+            elif key == "SliceNCenterZ":
+                info_pos[key] = value
+            elif key == "RowDirX":
+                info_pos[key] = value
+            elif key == "RowDirY":
+                info_pos[key] = value
+            elif key == "RowDirZ":
+                info_pos[key] = value
+            elif key == "ColDirX":
+                info_pos[key] = value
+            elif key == "ColDirY":
+                info_pos[key] = value
+            elif key == "ColDirZ":
+                info_pos[key] = value
+            elif key == "NRows":
+                info_pos[key] = value
+            elif key == "NCols":
+                info_pos[key] = value
+            elif key == "FoVRows":
+                info_pos[key] = value
+            elif key == "FoVCols":
+                info_pos[key] = value
+            elif key == "SliceThickness":
+                info_pos[key] = value
+            elif key == "GapThickness":
+                info_pos[key] = value
+            elif key == "PositionInformationFromImageHeaders":
+                pass
+
+            # --- Transformation ---
+            elif key == "NrOfPastSpatialTransformations":
+                info_tra[key] = int(value)
+            elif key == "NameOfSpatialTransformation":
+                info_tra[key] = value
+            elif key == "TypeOfSpatialTransformation":
+                info_tra[key] = value
+            elif key == "AppliedToFileName":
+                info_tra[key] = value
+            elif key == "NrOfTransformationValues":
+                info_tra[key] = value
+                # Multi-line affine matrix
+                nr_values = int(value)
+                affine = []
+                v = 0
+                n = 1
+                while v < nr_values:
+                    row_line = lines[j + n].strip().split()
+                    for val in row_line:
+                        affine.append(float(val))
+                    v += len(row_line)
+                    n += 1
+                j += n - 1  # skip consumed lines
+                info_tra["Transformation matrix"] = np.array(
+                    affine, dtype=np.float64
+                ).reshape(4, 4)
+
+            # --- Left-right convention ---
+            elif key == "LeftRightConvention":
+                instance.left_right_convention = value
+
+            # --- Multiband ---
+            elif key == "FirstDataSourceFile":
+                info_multiband[key] = value
+            elif key == "MultibandSequence":
+                info_multiband[key] = value
+            elif key == "MultibandFactor":
+                info_multiband[key] = value
+            elif key == "SliceTimingTableSize":
+                info_multiband[key] = int(value)
+                nr_values = int(value)
+                timings = []
+                for n in range(1, nr_values + 1):
+                    timings.append(float(lines[j + n].strip()))
+                j += nr_values
+                info_multiband["Slice timings"] = timings
+            elif key == "AcqusitionTime":
+                info_multiband[key] = value
+
+            j += 1
+
+        # Populate section objects
+        instance.position = FmrPositionInfo(
+            pos_infos_verified=info_pos.get("PosInfosVerified", ""),
+            coordinate_system=info_pos.get("CoordinateSystem", ""),
+            slice_1_center_x=info_pos.get("Slice1CenterX", ""),
+            slice_1_center_y=info_pos.get("Slice1CenterY", ""),
+            slice_1_center_z=info_pos.get("Slice1CenterZ", ""),
+            slice_n_center_x=info_pos.get("SliceNCenterX", ""),
+            slice_n_center_y=info_pos.get("SliceNCenterY", ""),
+            slice_n_center_z=info_pos.get("SliceNCenterZ", ""),
+            row_dir_x=info_pos.get("RowDirX", ""),
+            row_dir_y=info_pos.get("RowDirY", ""),
+            row_dir_z=info_pos.get("RowDirZ", ""),
+            col_dir_x=info_pos.get("ColDirX", ""),
+            col_dir_y=info_pos.get("ColDirY", ""),
+            col_dir_z=info_pos.get("ColDirZ", ""),
+            n_rows=info_pos.get("NRows", ""),
+            n_cols=info_pos.get("NCols", ""),
+            fov_rows=info_pos.get("FoVRows", ""),
+            fov_cols=info_pos.get("FoVCols", ""),
+            slice_thickness=info_pos.get("SliceThickness", ""),
+            gap_thickness=info_pos.get("GapThickness", ""),
+        )
+
+        instance.transform = FmrTransformInfo(
+            nr_of_past_spatial_transformations=info_tra.get(
+                "NrOfPastSpatialTransformations", 0
+            ),
+            name_of_spatial_transformation=info_tra.get(
+                "NameOfSpatialTransformation", ""
+            ),
+            type_of_spatial_transformation=info_tra.get(
+                "TypeOfSpatialTransformation", ""
+            ),
+            applied_to_file_name=info_tra.get("AppliedToFileName", ""),
+            nr_of_transformation_values=info_tra.get(
+                "NrOfTransformationValues", ""
+            ),
+            transformation_matrix=info_tra.get(
+                "Transformation matrix", None
+            ),
+        )
+
+        instance.multiband = FmrMultibandInfo(
+            first_data_source_file=info_multiband.get(
+                "FirstDataSourceFile", ""
+            ),
+            multiband_sequence=info_multiband.get(
+                "MultibandSequence", ""
+            ),
+            multiband_factor=info_multiband.get("MultibandFactor", ""),
+            slice_timing_table_size=info_multiband.get(
+                "SliceTimingTableSize", 0
+            ),
+            slice_timings=info_multiband.get("Slice timings", None),
+            acquisition_time=info_multiband.get("AcqusitionTime", ""),
+        )
+
+        # --- Load STC data ---
+        if load_data and instance.prefix:
+            dirname = os.path.dirname(filename)
+            stc_path = os.path.join(
+                dirname, "{}.stc".format(instance.prefix)
+            )
+            instance._values["data"] = read_stc(
+                stc_path,
+                nr_slices=instance.nr_of_slices,
+                nr_volumes=instance.nr_of_volumes,
+                res_x=instance.resolution_x,
+                res_y=instance.resolution_y,
+                data_type=instance.data_type,
+                rearrange_data_axes=True,
+            )
         else:
-            data = ""
-        f.write("LoadAMRFile:                   \"{}\"\n".format(data))
-        data = header["ShowAMRFile"]
-        f.write("ShowAMRFile:                   {}\n".format(data))
-        data = header["ImageIndex"]
-        f.write("ImageIndex:                    {}\n".format(data))
-        data = header["LayoutNColumns"]
-        f.write("LayoutNColumns:                {}\n".format(data))
-        data = header["LayoutNRows"]
-        f.write("LayoutNRows:                   {}\n".format(data))
-        data = header["LayoutZoomLevel"]
-        f.write("LayoutZoomLevel:               {}\n".format(data))
-        data = header["SegmentSize"]
-        f.write("SegmentSize:                   {}\n".format(data))
-        data = header["SegmentOffset"]
-        f.write("SegmentOffset:                 {}\n".format(data))
-        data = header["NrOfLinkedProtocols"]
-        f.write("NrOfLinkedProtocols:           {}\n".format(data))
-        if "ProtocolFile" in header:
-            data = header["ProtocolFile"]
-        else:
-            data = ""
-        f.write("ProtocolFile:                  \"{}\"\n".format(data))
-        data = header["InplaneResolutionX"]
-        f.write("InplaneResolutionX:            {}\n".format(data))
-        data = header["InplaneResolutionY"]
-        f.write("InplaneResolutionY:            {}\n".format(data))
-        data = header["SliceThickness"]
-        f.write("SliceThickness:                {}\n".format(data))
-        data = header["SliceGap"]
-        f.write("SliceGap:                      {}\n".format(data))
-        data = header["VoxelResolutionVerified"]
-        f.write("VoxelResolutionVerified:       {}\n".format(data))
-        f.write("\n")
+            instance._values["data"] = None
 
-        # ---------------------------------------------------------------------
-        # Position information
-        f.write("\n")
-        f.write("PositionInformationFromImageHeaders\n")
-        f.write("\n")
-        data = info_pos["PosInfosVerified"]
-        f.write("PosInfosVerified: {}\n".format(data))
-        data = info_pos["CoordinateSystem"]
-        f.write("CoordinateSystem: {}\n".format(data))
-        data = info_pos["Slice1CenterX"]
-        f.write("Slice1CenterX:    {}\n".format(data))
-        data = info_pos["Slice1CenterY"]
-        f.write("Slice1CenterY:    {}\n".format(data))
-        data = info_pos["Slice1CenterZ"]
-        f.write("Slice1CenterZ:    {}\n".format(data))
-        data = info_pos["SliceNCenterX"]
-        f.write("SliceNCenterX:    {}\n".format(data))
-        data = info_pos["SliceNCenterY"]
-        f.write("SliceNCenterY:    {}\n".format(data))
-        data = info_pos["SliceNCenterZ"]
-        f.write("SliceNCenterZ:    {}\n".format(data))
-        data = info_pos["RowDirX"]
-        f.write("RowDirX:          {}\n".format(data))
-        data = info_pos["RowDirY"]
-        f.write("RowDirY:          {}\n".format(data))
-        data = info_pos["RowDirZ"]
-        f.write("RowDirZ:          {}\n".format(data))
-        data = info_pos["ColDirX"]
-        f.write("ColDirX:          {}\n".format(data))
-        data = info_pos["ColDirY"]
-        f.write("ColDirY:          {}\n".format(data))
-        data = info_pos["ColDirZ"]
-        f.write("ColDirZ:          {}\n".format(data))
-        data = info_pos["NRows"]
-        f.write("NRows:            {}\n".format(data))
-        data = info_pos["NCols"]
-        f.write("NCols:            {}\n".format(data))
-        data = info_pos["FoVRows"]
-        f.write("FoVRows:          {}\n".format(data))
-        data = info_pos["FoVCols"]
-        f.write("FoVCols:          {}\n".format(data))
-        data = info_pos["SliceThickness"]
-        f.write("SliceThickness:   {}\n".format(data))
-        data = info_pos["GapThickness"]
-        f.write("GapThickness:     {}\n".format(data))
-        f.write("\n")
+        return instance
 
-        # ---------------------------------------------------------------------
-        # Transformations section
-        if info_tra["NrOfPastSpatialTransformations"] > 0:
+    def write(self, filename):
+        """Write FMR text header and paired STC data file."""
+        info_pos = self.position
+        info_tra = self.transform
+        info_multiband = self.multiband
+        basepath = filename.split(os.extsep, 1)[0]
+        basename = os.path.basename(basepath)
+
+        with open(filename, "w") as f:
             f.write("\n")
-            data = info_tra["NrOfPastSpatialTransformations"]
-            f.write("NrOfPastSpatialTransformations: {}\n".format(data))
-
-            f.write("\n")
-            data = info_tra["NameOfSpatialTransformation"]
-            f.write("NameOfSpatialTransformation: {}\n".format(data))
-            data = info_tra["TypeOfSpatialTransformation"]
-            f.write("TypeOfSpatialTransformation: {}\n".format(data))
-            data = info_tra["AppliedToFileName"]
-            f.write("AppliedToFileName:           {}\n".format(data))
-            data = info_tra["NrOfTransformationValues"]
-            f.write("NrOfTransformationValues:    {}\n".format(data))
-
-            affine = info_tra["Transformation matrix"]
-            for i in range(4):
-                f.write(" {:8.5f}  ".format(affine[i, 0]))
-                f.write(" {:8.5f}  ".format(affine[i, 1]))
-                f.write(" {:8.5f}  ".format(affine[i, 2]))
-                f.write(" {:8.5f}  \n".format(affine[i, 3]))
+            f.write(f"FileVersion:                   {self.file_version}\n")
+            f.write(f"NrOfVolumes:                   {self.nr_of_volumes}\n")
+            f.write(f"NrOfSlices:                    {self.nr_of_slices}\n")
+            f.write(f"NrOfSkippedVolumes:            {self.nr_of_skipped_volumes}\n")
+            f.write(f'Prefix:                        "{basename}"\n')
+            f.write(f"DataStorageFormat:             {self.data_storage_format}\n")
+            f.write(f"DataType:                      {self.data_type}\n")
+            f.write(f"TR:                            {self.tr}\n")
+            f.write(f"InterSliceTime:                {self.inter_slice_time}\n")
+            f.write(f"TimeResolutionVerified:        {self.time_resolution_verified}\n")
+            f.write(f"TE:                            {self.te}\n")
+            f.write(f"SliceAcquisitionOrder:         {self.slice_acquisition_order}\n")
+            f.write(f"SliceAcquisitionOrderVerified: {self.slice_acquisition_order_verified}\n")
+            f.write(f"ResolutionX:                   {self.resolution_x}\n")
+            f.write(f"ResolutionY:                   {self.resolution_y}\n")
+            load_amr = getattr(self, "load_amr_file", "")
+            f.write(f'LoadAMRFile:                   "{load_amr}"\n')
+            f.write(f"ShowAMRFile:                   {self.show_amr_file}\n")
+            f.write(f"ImageIndex:                    {self.image_index}\n")
+            f.write(f"LayoutNColumns:                {self.layout_n_columns}\n")
+            f.write(f"LayoutNRows:                   {self.layout_n_rows}\n")
+            f.write(f"LayoutZoomLevel:               {self.layout_zoom_level}\n")
+            f.write(f"SegmentSize:                   {self.segment_size}\n")
+            f.write(f"SegmentOffset:                 {self.segment_offset}\n")
+            f.write(f"NrOfLinkedProtocols:           {self.nr_of_linked_protocols}\n")
+            protocol = getattr(self, "protocol_file", "")
+            f.write(f'ProtocolFile:                  "{protocol}"\n')
+            f.write(f"InplaneResolutionX:            {self.inplane_resolution_x}\n")
+            f.write(f"InplaneResolutionY:            {self.inplane_resolution_y}\n")
+            f.write(f"SliceThickness:                {self.slice_thickness}\n")
+            f.write(f"SliceGap:                      {self.slice_gap}\n")
+            f.write(f"VoxelResolutionVerified:       {self.voxel_resolution_verified}\n")
             f.write("\n")
 
-        # -----------------------------------------------------------------
-        # This part only contains a single information
-        f.write("\n")
-        data = header["LeftRightConvention"]
-        f.write("LeftRightConvention: {}\n".format(data))
-        f.write("\n")
-
-        # -----------------------------------------------------------------
-        # Multiband section
-        if len(info_multiband.keys()) > 0:
+            # Position info
             f.write("\n")
-            if "FirstDataSourceFile" in info_multiband:
-                data = info_multiband["FirstDataSourceFile"]
-                f.write("FirstDataSourceFile: {}\n".format(data))
+            f.write("PositionInformationFromImageHeaders\n")
+            f.write("\n")
+            f.write(f"PosInfosVerified: {info_pos.pos_infos_verified}\n")
+            f.write(f"CoordinateSystem: {info_pos.coordinate_system}\n")
+            f.write(f"Slice1CenterX:    {info_pos.slice_1_center_x}\n")
+            f.write(f"Slice1CenterY:    {info_pos.slice_1_center_y}\n")
+            f.write(f"Slice1CenterZ:    {info_pos.slice_1_center_z}\n")
+            f.write(f"SliceNCenterX:    {info_pos.slice_n_center_x}\n")
+            f.write(f"SliceNCenterY:    {info_pos.slice_n_center_y}\n")
+            f.write(f"SliceNCenterZ:    {info_pos.slice_n_center_z}\n")
+            f.write(f"RowDirX:          {info_pos.row_dir_x}\n")
+            f.write(f"RowDirY:          {info_pos.row_dir_y}\n")
+            f.write(f"RowDirZ:          {info_pos.row_dir_z}\n")
+            f.write(f"ColDirX:          {info_pos.col_dir_x}\n")
+            f.write(f"ColDirY:          {info_pos.col_dir_y}\n")
+            f.write(f"ColDirZ:          {info_pos.col_dir_z}\n")
+            f.write(f"NRows:            {info_pos.n_rows}\n")
+            f.write(f"NCols:            {info_pos.n_cols}\n")
+            f.write(f"FoVRows:          {info_pos.fov_rows}\n")
+            f.write(f"FoVCols:          {info_pos.fov_cols}\n")
+            f.write(f"SliceThickness:   {info_pos.slice_thickness}\n")
+            f.write(f"GapThickness:     {info_pos.gap_thickness}\n")
+            f.write("\n")
 
-            if "MultibandSequence" in info_multiband:
-                data = info_multiband["MultibandSequence"]
-                f.write("MultibandSequence: {}\n".format(data))
-
-            if "MultibandFactor" in info_multiband:
-                data = info_multiband["MultibandFactor"]
-                f.write("MultibandFactor:   {}\n".format(data))
-
-            if "SliceTimingTableSize" in info_multiband:
-                data = info_multiband["SliceTimingTableSize"]
-                f.write("SliceTimingTableSize: {}\n".format(data))
-                slice_timings = info_multiband["Slice timings"]
-                for i in range(info_multiband["SliceTimingTableSize"]):
-                    f.write("{}\n".format(slice_timings[i]))
-
-            if "AcqusitionTime" in info_multiband:
+            # Transformation
+            if info_tra.nr_of_past_spatial_transformations > 0:
                 f.write("\n")
-                data = info_multiband["AcqusitionTime"]
-                f.write("AcqusitionTime: {}\n".format(data))
+                f.write(f"NrOfPastSpatialTransformations: {info_tra.nr_of_past_spatial_transformations}\n")
+                f.write("\n")
+                f.write(f"NameOfSpatialTransformation: {info_tra.name_of_spatial_transformation}\n")
+                f.write(f"TypeOfSpatialTransformation: {info_tra.type_of_spatial_transformation}\n")
+                f.write(f"AppliedToFileName:           {info_tra.applied_to_file_name}\n")
+                f.write(f"NrOfTransformationValues:    {info_tra.nr_of_transformation_values}\n")
+                if info_tra.transformation_matrix is not None:
+                    aff = info_tra.transformation_matrix
+                    for i in range(4):
+                        f.write(" {:8.5f}  {:8.5f}  {:8.5f}  {:8.5f}  \n".format(
+                            aff[i, 0], aff[i, 1], aff[i, 2], aff[i, 3]))
                 f.write("\n")
 
-    # -------------------------------------------------------------------------
-    # Write voxel data as a separate STC file
-    dirname = os.path.dirname(filename)
-    filename_stc = os.path.join(dirname, "{}.stc".format(basename))
-    write_stc(filename_stc, data_img, data_type=header["DataType"],
-              rearrange_data_axes=rearrange_data_axes)
+            # Left-right convention
+            f.write("\n")
+            f.write(f"LeftRightConvention: {self.left_right_convention}\n")
+            f.write("\n")
+
+            # Multiband
+            if info_multiband._values:
+                f.write("\n")
+                if info_multiband.first_data_source_file:
+                    f.write(f"FirstDataSourceFile: {info_multiband.first_data_source_file}\n")
+                if info_multiband.multiband_sequence:
+                    f.write(f"MultibandSequence: {info_multiband.multiband_sequence}\n")
+                if info_multiband.multiband_factor:
+                    f.write(f"MultibandFactor:   {info_multiband.multiband_factor}\n")
+                if info_multiband.slice_timing_table_size:
+                    f.write(f"SliceTimingTableSize: {info_multiband.slice_timing_table_size}\n")
+                    if info_multiband.slice_timings:
+                        for t in info_multiband.slice_timings:
+                            f.write(f"{t}\n")
+                if info_multiband.acquisition_time:
+                    f.write("\n")
+                    f.write(f"AcqusitionTime: {info_multiband.acquisition_time}\n")
+                    f.write("\n")
+
+        # Write STC data
+        dirname = os.path.dirname(filename)
+        stc_path = os.path.join(dirname, "{}.stc".format(basename))
+        data = self._values.get("data")
+        if data is not None:
+            write_stc(
+                stc_path, data, data_type=self.data_type,
+                rearrange_data_axes=True,
+            )
+
+    # -- Data (populated from paired STC file) ---------------------------
+    data = DataField(dtype="<f", shape_fields=())
+
+    # -- Factory ---------------------------------------------------------
+
+    @classmethod
+    def create_default(cls, nr_volumes=100, nr_slices=16,
+                       res_x=80, res_y=80):
+        fmr = cls()
+        fmr.file_version = "7"
+        fmr.nr_of_volumes = nr_volumes
+        fmr.nr_of_slices = nr_slices
+        fmr.nr_of_skipped_volumes = "0"
+        fmr.prefix = "bvbabel_default_fmr"
+        fmr.data_storage_format = 2
+        fmr.data_type = 2
+        fmr.tr = "2000"
+        fmr.inter_slice_time = "31"
+        fmr.time_resolution_verified = "1"
+        fmr.te = "30"
+        fmr.slice_acquisition_order = "5"
+        fmr.slice_acquisition_order_verified = "1"
+        fmr.resolution_x = res_x
+        fmr.resolution_y = res_y
+        fmr.load_amr_file = ""
+        fmr.show_amr_file = "1"
+        fmr.image_index = "0"
+        fmr.layout_n_columns = str(int(np.ceil(np.sqrt(nr_slices))))
+        fmr.layout_n_rows = str(int(np.ceil(np.sqrt(nr_slices))))
+        fmr.layout_zoom_level = "1"
+        fmr.segment_size = "10"
+        fmr.segment_offset = "0"
+        fmr.nr_of_linked_protocols = "0"
+        fmr.protocol_file = ""
+        fmr.inplane_resolution_x = "2"
+        fmr.inplane_resolution_y = "2"
+        fmr.slice_thickness = "2"
+        fmr.slice_gap = "0"
+        fmr.voxel_resolution_verified = "1"
+        fmr.left_right_convention = "0"
+
+        fmr.position = FmrPositionInfo(
+            pos_infos_verified="1",
+            coordinate_system="1",
+            slice_1_center_x="-8.34283",
+            slice_1_center_y="-13.0168",
+            slice_1_center_z="-12.9074",
+            slice_n_center_x="-8.34283",
+            slice_n_center_y="23.4012",
+            slice_n_center_z="107.715",
+            row_dir_x="1.0",
+            row_dir_y="0.0",
+            row_dir_z="0.0",
+            col_dir_x="0.0",
+            col_dir_y="0.957319",
+            col_dir_z="-0.289032",
+            n_rows="100",
+            n_cols="100",
+            fov_rows="200",
+            fov_cols="200",
+            slice_thickness="2",
+            gap_thickness="0",
+        )
+        fmr.transform = FmrTransformInfo()
+        fmr.multiband = FmrMultibandInfo()
+
+        dims = (res_y, res_x, nr_slices, nr_volumes)
+        fmr.data = (np.random.random(np.prod(dims)) * (2**16)).astype(
+            np.uint16
+        ).reshape(dims)
+        return fmr
+
+    # -- Legacy key mapping ----------------------------------------------
+
+    _LEGACY_MAP = {
+        "file_version": "FileVersion",
+        "nr_of_volumes": "NrOfVolumes",
+        "nr_of_slices": "NrOfSlices",
+        "nr_of_skipped_volumes": "NrOfSkippedVolumes",
+        "prefix": "Prefix",
+        "data_storage_format": "DataStorageFormat",
+        "data_type": "DataType",
+        "tr": "TR",
+        "inter_slice_time": "InterSliceTime",
+        "time_resolution_verified": "TimeResolutionVerified",
+        "te": "TE",
+        "slice_acquisition_order": "SliceAcquisitionOrder",
+        "slice_acquisition_order_verified": "SliceAcquisitionOrderVerified",
+        "resolution_x": "ResolutionX",
+        "resolution_y": "ResolutionY",
+        "load_amr_file": "LoadAMRFile",
+        "show_amr_file": "ShowAMRFile",
+        "image_index": "ImageIndex",
+        "layout_n_columns": "LayoutNColumns",
+        "layout_n_rows": "LayoutNRows",
+        "layout_zoom_level": "LayoutZoomLevel",
+        "segment_size": "SegmentSize",
+        "segment_offset": "SegmentOffset",
+        "nr_of_linked_protocols": "NrOfLinkedProtocols",
+        "protocol_file": "ProtocolFile",
+        "inplane_resolution_x": "InplaneResolutionX",
+        "inplane_resolution_y": "InplaneResolutionY",
+        "slice_thickness": "SliceThickness",
+        "slice_gap": "SliceGap",
+        "voxel_resolution_verified": "VoxelResolutionVerified",
+        "left_right_convention": "LeftRightConvention",
+    }
+    _LEGACY_REVERSE = {v: k for k, v in _LEGACY_MAP.items()}
+
+    _POS_LEGACY_MAP = {
+        "pos_infos_verified": "PosInfosVerified",
+        "coordinate_system": "CoordinateSystem",
+        "slice_1_center_x": "Slice1CenterX",
+        "slice_1_center_y": "Slice1CenterY",
+        "slice_1_center_z": "Slice1CenterZ",
+        "slice_n_center_x": "SliceNCenterX",
+        "slice_n_center_y": "SliceNCenterY",
+        "slice_n_center_z": "SliceNCenterZ",
+        "row_dir_x": "RowDirX",
+        "row_dir_y": "RowDirY",
+        "row_dir_z": "RowDirZ",
+        "col_dir_x": "ColDirX",
+        "col_dir_y": "ColDirY",
+        "col_dir_z": "ColDirZ",
+        "n_rows": "NRows",
+        "n_cols": "NCols",
+        "fov_rows": "FoVRows",
+        "fov_cols": "FoVCols",
+        "slice_thickness": "SliceThickness",
+        "gap_thickness": "GapThickness",
+    }
+
+    _TRA_LEGACY_MAP = {
+        "nr_of_past_spatial_transformations": "NrOfPastSpatialTransformations",
+        "name_of_spatial_transformation": "NameOfSpatialTransformation",
+        "type_of_spatial_transformation": "TypeOfSpatialTransformation",
+        "applied_to_file_name": "AppliedToFileName",
+        "nr_of_transformation_values": "NrOfTransformationValues",
+        "transformation_matrix": "Transformation matrix",
+    }
+
+    _MULTI_LEGACY_MAP = {
+        "first_data_source_file": "FirstDataSourceFile",
+        "multiband_sequence": "MultibandSequence",
+        "multiband_factor": "MultibandFactor",
+        "slice_timing_table_size": "SliceTimingTableSize",
+        "slice_timings": "Slice timings",
+        "acquisition_time": "AcqusitionTime",
+    }
+
+    def to_legacy_dict(self):
+        result = {}
+        for py_name, legacy_name in self._LEGACY_MAP.items():
+            result[legacy_name] = getattr(self, py_name)
+
+        pos = {}
+        for py_name, legacy_name in self._POS_LEGACY_MAP.items():
+            pos[legacy_name] = getattr(self.position, py_name, "")
+        result["Position information"] = pos
+
+        tra = {}
+        for py_name, legacy_name in self._TRA_LEGACY_MAP.items():
+            tra[legacy_name] = getattr(self.transform, py_name, "")
+        result["Transformation information"] = tra
+
+        multi = {}
+        for py_name, legacy_name in self._MULTI_LEGACY_MAP.items():
+            multi[legacy_name] = getattr(self.multiband, py_name, "")
+        result["Multiband information"] = multi
+
+        return result
+
+    @classmethod
+    def from_legacy_dict(cls, d, data=None):
+        kwargs = {}
+        for legacy_name, py_name in cls._LEGACY_REVERSE.items():
+            if legacy_name in d:
+                kwargs[py_name] = d[legacy_name]
+        instance = cls(**kwargs)
+
+        pos_d = d.get("Position information", {})
+        pos_kwargs = {}
+        for py_name, legacy_name in cls._POS_LEGACY_MAP.items():
+            if legacy_name in pos_d:
+                pos_kwargs[py_name] = pos_d[legacy_name]
+        instance.position = FmrPositionInfo(**pos_kwargs)
+
+        tra_d = d.get("Transformation information", {})
+        tra_kwargs = {}
+        for py_name, legacy_name in cls._TRA_LEGACY_MAP.items():
+            if legacy_name in tra_d:
+                tra_kwargs[py_name] = tra_d[legacy_name]
+        instance.transform = FmrTransformInfo(**tra_kwargs)
+
+        multi_d = d.get("Multiband information", {})
+        multi_kwargs = {}
+        for py_name, legacy_name in cls._MULTI_LEGACY_MAP.items():
+            if legacy_name in multi_d:
+                multi_kwargs[py_name] = multi_d[legacy_name]
+        instance.multiband = FmrMultibandInfo(**multi_kwargs)
+
+        if data is not None:
+            instance.data = data
+        return instance
+
+
+# =============================================================================
+# Backward-compatible shims
+# =============================================================================
+
+def read_fmr(filename, rearrange_data_axes=True):
+    """Read BrainVoyager FMR file (legacy API).
+
+    The *rearrange_data_axes* flag is accepted for compatibility but
+    has no effect — data is always returned in RAS-like layout.
+    """
+    fmr = FMR.read(filename)
+    return fmr.to_legacy_dict(), fmr.data
+
+
+def write_fmr(filename, header, data_img, rearrange_data_axes=True):
+    """Write BrainVoyager FMR file (legacy API)."""
+    fmr = FMR.from_legacy_dict(header, data=data_img)
+    fmr.write(filename)
 
 
 def create_fmr():
-    """Create BrainVoyager FMR file with default values."""
-    header = dict()
-    info_pos = dict()
-    info_tra = dict()
-    info_multiband = dict()
-
-    header["FileVersion"] = 7
-    header["NrOfVolumes"] = 100
-    header["NrOfSlices"] = 16
-    header["NrOfSkippedVolumes"] = 0
-    header["Prefix"] = "bvbabel_default_fmr"
-    header["DataStorageFormat"] = 2
-    header["DataType"] = 2
-    header["TR"] = 2000
-    header["InterSliceTime"] = 31
-    header["TimeResolutionVerified"] = 1
-    header["TE"] = 30
-    header["SliceAcquisitionOrder"] = 5
-    header["SliceAcquisitionOrderVerified"] = 1
-    header["ResolutionX"] = 80
-    header["ResolutionY"] = 80
-    header["LoadAMRFile"] = ""
-    header["ShowAMRFile"] = 1
-    header["ImageIndex"] = 0
-    header["LayoutNColumns"] = int(np.ceil(np.sqrt(header["NrOfSlices"])))
-    header["LayoutNRows"] = int(np.ceil(np.sqrt(header["NrOfSlices"])))
-    header["LayoutZoomLevel"] = 1
-    header["SegmentSize"] = 10
-    header["SegmentOffset"] = 0
-    header["NrOfLinkedProtocols"] = 0
-    header["ProtocolFile"] = ""
-    header["InplaneResolutionX"] = 2
-    header["InplaneResolutionY"] = 2
-    header["SliceThickness"] = 2
-    header["SliceGap"] = 0
-    header["VoxelResolutionVerified"] = 1
-
-    # -------------------------------------------------------------------------
-    # Position information
-    info_pos["PosInfosVerified"] = 1
-    info_pos["CoordinateSystem"] = 1
-    info_pos["Slice1CenterX"] = -8.34283
-    info_pos["Slice1CenterY"] = -13.0168
-    info_pos["Slice1CenterZ"] = -12.9074
-    info_pos["SliceNCenterX"] = -8.34283
-    info_pos["SliceNCenterY"] = 23.4012
-    info_pos["SliceNCenterZ"] = 107.715
-    info_pos["RowDirX"] = 1
-    info_pos["RowDirY"] = 0
-    info_pos["RowDirZ"] = 0
-    info_pos["ColDirX"] = 0
-    info_pos["ColDirY"] = 0.957319
-    info_pos["ColDirZ"] = -0.289032
-    info_pos["NRows"] = 100
-    info_pos["NCols"] = 100
-    info_pos["FoVRows"] = 200
-    info_pos["FoVCols"] = 200
-    info_pos["SliceThickness"] = 2
-    info_pos["GapThickness"] = 0
-
-    header["Position information"] = info_pos
-    # -------------------------------------------------------------------------
-    # Transformations section
-    # NOTE[Faruk]: Skip this part for now.
-    info_tra["NrOfPastSpatialTransformations"] = 0
-
-    # -------------------------------------------------------------------------
-    # This part only contains a single information
-    header["LeftRightConvention"] = 0
-
-    header["Position information"] = info_pos
-    header["Transformation information"] = info_tra
-    header["Multiband information"] = info_multiband
-
-    # =========================================================================
-    # Create random data
-    DimX = header["ResolutionX"]
-    DimY = header["ResolutionY"]
-    DimZ = header["NrOfSlices"]
-    DimT = header["NrOfVolumes"]
-    dims = [DimZ, DimT, DimY, DimX]
-    data_img = np.random.random(np.prod(dims)) * (2**16)
-    data_img = data_img.reshape(dims)
-    data_img = data_img.astype(np.uint16)
-
-    return header, data_img
-
+    """Create BrainVoyager FMR file with default values (legacy API)."""
+    fmr = FMR.create_default()
+    return fmr.to_legacy_dict(), fmr.data

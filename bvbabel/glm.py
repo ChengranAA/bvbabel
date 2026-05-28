@@ -1,362 +1,390 @@
-"""Read, write, create BrainVoyager GLM file format."""
+"""Read, write, create BrainVoyager GLM (general linear model) file format.
+
+Typed API
+---------
+    glm = GLM.read("results.glm")
+    print(glm.glm_type, glm.nr_time_points)
+    print(glm.data_R2.shape, glm.data_beta.shape)
+"""
 
 import struct
 import numpy as np
+from bvbabel._binary_format import (
+    Field, StringField, RGBField, DataField, ObjectField,
+    TypedSubRecordListField, BinaryFormat, register_format,
+)
 from bvbabel.utils import read_variable_length_string, read_RGB_bytes
-from bvbabel.utils import write_variable_length_string, write_RGB_bytes
 
 
 # =============================================================================
-def read_glm(filename):
-    """Read BrainVoyager GLM file.
+# Sub-records
+# =============================================================================
 
-    Parameters
-    ----------
-    filename : string
-        Path to file.
+class StudyInfo(BinaryFormat):
+    """Metadata for a single study within a multi-study GLM."""
 
-    Returns
-    -------
-    header : dictionary
-        Pre-data headers.
-    data_R2 : 3D (if volume) OR 1D (if vertices) numpy.array
-        Multiple correlation coefficient R indicating the goodness-of-fit for
-        the respective voxel's time course and to allow to calculate the
-        proportion of explained (R^2) and unexplained (1 - R^2) variance.
-    data_SS : 3D (if volume) OR 1D (if vertices) numpy.array
-        Sum-of-squares term (SS_total) that can be used together with the R
-        value to calculate the variance of the residuals.
-    data_beta : 4D (if volume) OR 2D (if vertices) numpy.array
-        Estimated beta values. One value for each predictor of the design
-        matrix ("Nr all predictors" values).
-    data_SS_XiY = 4D (if volume) OR 2D (if vertices) numpy.array
-        Sum-of-squares indicating the covariation of each predictor with the
-        time course data (SS_XiY). These values are stored to allow easy
-        calculation of explained variance terms for restricted models (i.e. to
-        allow application of the extra-sum-of-squares principle); these values
-        may be ignored (not stored) for custom processing.
-    data_meantc "" 3D (if volume) OR 1D (if vertices) numpy.array
-        Mean value of the (normalized) fMRI time course.
-    data_ARlag : 3D or 4D (if volume) OR 1D or 2D (if vertices) numpy.array
-        Auto-regression lag value. If "serial correlation" is 1, this will be a
-        3D numpy.array (if volume) or 1D numpy.array (if vertices). If "serial
-        correlation" is 2, this will be a 4D numpy.array (if volume) or 2D
-        numpy.array (if vertices). If "serial correlation" is zero, this will
-        be a 3D numpy.array (if volume) or 1D numpy.array (if vertices)
-        containing all zeros (can be ignored)
+    nr_time_points_in_study = Field("<i")
+    name_of_study_data = StringField()
+    name_of_ssm = StringField(condition=lambda s: False)   # set manually
+    name_of_sdm = StringField()
 
-    Notes
-    -----
-        - NOTE[Faruk]: "Developer Guide - The Format Of GLM Files (v4)" has
-    interesting details about calculating standard errors for beta and contrast
-    values. In order to retain this extra information, I am including these
-    notes below.
-        - The (non-RFX) GLM file stores enough values to allow calculation of
-    standard errors for beta and contrast values for each voxel. The stored
-    multiple correlation coefficient R (data_R2) together with the overall
-    sum-of-squares term (data_SS) can be used to calculate the variance of
-    the residuals as follows:
-        `VAR_residuals = data_SS * (1 - data_R2) / (header["Nr time points"]  - header["Nr all predictors"])`
-    Together with the stored inverted X'X matrix, this allows calculating the
-    standard error for any beta or contrast t value using the usual equation
-    (c is the contrast vector and b is the voxel's vector of stored beta
-    values):
-        `t = c'b / sqrt(VAR_residuals * c' * header["Inverted X'X matrix"] * c)`
-    However, note that in case of performed serial correlation correction, the
-    inverted X'X matrix needs to be recalculated for each voxel from the stored
-    design matrix X using the voxel-specific autocorrelation function term(s);
-    furthermore the number of time points (NTimePoints) needs to be corrected
-    [subtraction of 1 for AR(1) model, subtraction of 2 for AR(2) model].
 
-    """
-    header = dict()
-    with open(filename, 'rb') as f:
-        # ---------------------------------------------------------------------
-        # GLM Header
-        # ---------------------------------------------------------------------
-        # Expected binary data: short int (2 bytes)
-        data, = struct.unpack('<h', f.read(2))
-        header["File version"] = data
+class PredictorInfo(BinaryFormat):
+    """Metadata for a single predictor."""
 
-        # Expected binary data: char (1 byte)
-        data, = struct.unpack('<B', f.read(1))
-        header["Type (0: FMR-STC, 1:VMR-VTC, 2:SRF-MTC"] = int(data)
-        data, = struct.unpack('<B', f.read(1))
-        header["RFX-GLM (0:std, 1:RFX)"] = int(data)
+    name_internal = StringField()
+    name_custom = StringField()
+    color = RGBField()
+    # 9 unknown bytes follow — handled manually
 
-        # Random effects GLM
-        if header["RFX-GLM (0:std, 1:RFX)"] == 1:
-            # Expected binary data: int (4 bytes)
-            data, = struct.unpack('<i', f.read(4))
-            header["Nr subjects"] = int(data)
-            data, = struct.unpack('<i', f.read(4))
-            header["Nr predictors per subject"] = int(data)
 
-        # Expected binary data: int (4 bytes)
-        data, = struct.unpack('<i', f.read(4))
-        header["Nr time points"] = int(data)
-        data, = struct.unpack('<i', f.read(4))
-        header["Nr all predictors"] = int(data)
-        data, = struct.unpack('<i', f.read(4))
-        header["Nr confound predictors"] = int(data)
-        data, = struct.unpack('<i', f.read(4))
-        header["Nr studies"] = int(data)
+# =============================================================================
+# GLM format
+# =============================================================================
 
-        if header["Nr studies"] > 1:
-            data, = struct.unpack('<i', f.read(4))
-            header["Nr studies with confound info"] = int(data)
-            header["Nr confounds per study"] = []
-            for i in range(header["Nr studies with confound info"]):
-                data, = struct.unpack('<i', f.read(4))
-                header["Nr confounds per study"].append(int(data))
+@register_format(".glm")
+class GLM(BinaryFormat):
+    """Typed BrainVoyager GLM (general linear model results)."""
 
-        # Expected binary data: char (1 byte)
-        data, = struct.unpack('<B', f.read(1))
-        header["Separate predictors (0:no, 1:studies, 2:subjects)"] = int(data)
-        data, = struct.unpack('<B', f.read(1))
-        header["Time course normalization (1:z transform, 2:baseline z, 3:percent change)"] = int(data)
+    # -- Header ----------------------------------------------------------
+    file_version = Field("<h")
+    glm_type = Field("<B")    # 0=FMR-STC, 1=VMR-VTC, 2=SRF-MTC
+    rfx_glm = Field("<B")     # 0=std, 1=RFX
 
-        # Expected binary data: short int (2 bytes)
-        data, = struct.unpack('<h', f.read(2))
-        header["Resolution multiplier (1, 2, 3 times VMR resolution)"] = int(data)
+    # RFX fields
+    nr_subjects = Field(
+        "<i", condition=lambda s: s.rfx_glm == 1
+    )
+    nr_predictors_per_subject = Field(
+        "<i", condition=lambda s: s.rfx_glm == 1
+    )
 
-        # Expected binary data: char (1 byte)
-        data, = struct.unpack('<B', f.read(1))
-        header["Serial correlation(0:no, 1:AR(1), 2:AR(2))"] = int(data)
+    nr_time_points = Field("<i")
+    nr_all_predictors = Field("<i")
+    nr_confound_predictors = Field("<i")
+    nr_studies = Field("<i")
 
-        # Expected binary data: float (4 bytes)
-        data, = struct.unpack('<f', f.read(4))
-        header["Mean serial correlation before correction"] = float(data)
-        data, = struct.unpack('<f', f.read(4))
-        header["Mean serial correlation after correction"] = float(data)
+    nr_studies_with_confound_info = Field(
+        "<i", condition=lambda s: s.nr_studies > 1
+    )
+    # nr_confounds_per_study: variable-length int list — handled manually
 
-        # FMR-STC GLM
-        if header["Type (0: FMR-STC, 1:VMR-VTC, 2:SRF-MTC"] == 0:
-            # Expected binary data: short int (2 bytes)
-            data, = struct.unpack('<h', f.read(2))
-            header["DimX"] = int(data)
-            data, = struct.unpack('<h', f.read(2))
-            header["DimY"] = int(data)
-            data, = struct.unpack('<h', f.read(2))
-            header["DimZ"] = int(data)
+    separate_predictors = Field("<B")
+    time_course_normalization = Field("<B")
+    resolution_multiplier = Field("<h")
+    serial_correlation = Field("<B")
+    mean_serial_correlation_before = Field("<f")
+    mean_serial_correlation_after = Field("<f")
 
-        # VMR-VTC GLM
-        if header["Type (0: FMR-STC, 1:VMR-VTC, 2:SRF-MTC"] == 1:
-            # Expected binary data: short int (2 bytes)
-            data, = struct.unpack('<h', f.read(2))
-            header["XStart"] = int(data)
-            data, = struct.unpack('<h', f.read(2))
-            header["XEnd"] = int(data)
-            data, = struct.unpack('<h', f.read(2))
-            header["YStart"] = int(data)
-            data, = struct.unpack('<h', f.read(2))
-            header["YEnd"] = int(data)
-            data, = struct.unpack('<h', f.read(2))
-            header["ZStart"] = int(data)
-            data, = struct.unpack('<h', f.read(2))
-            header["ZEnd"] = int(data)
+    # -- Type-dependent spatial fields -----------------------------------
+    # FMR-STC
+    dim_x = Field("<h", condition=lambda s: s.glm_type == 0)
+    dim_y = Field("<h", condition=lambda s: s.glm_type == 0)
+    dim_z = Field("<h", condition=lambda s: s.glm_type == 0)
 
-        # SRF-MTC GLM
-        if header["Type (0: FMR-STC, 1:VMR-VTC, 2:SRF-MTC"] == 2:
-            # Expected binary data: int (4 bytes)
-            data, = struct.unpack('<i', f.read(4))
-            header["Nr vertices"] = int(data)
+    # VMR-VTC
+    x_start = Field("<h", condition=lambda s: s.glm_type == 1)
+    x_end = Field("<h", condition=lambda s: s.glm_type == 1)
+    y_start = Field("<h", condition=lambda s: s.glm_type == 1)
+    y_end = Field("<h", condition=lambda s: s.glm_type == 1)
+    z_start = Field("<h", condition=lambda s: s.glm_type == 1)
+    z_end = Field("<h", condition=lambda s: s.glm_type == 1)
 
-        # Expected binary data: char (1 byte)
-        data, = struct.unpack('<B', f.read(1))
-        header["Cortex-based mask (1:(grey matter) mask has been used)"] = data
+    # SRF-MTC
+    nr_vertices = Field("<i", condition=lambda s: s.glm_type == 2)
 
-        # Expected binary data: int (4 bytes)
-        data, = struct.unpack('<i', f.read(4))
-        header["Nr voxels in mask"] = data
+    cortex_based_mask = Field("<B")
+    nr_voxels_in_mask = Field("<i")
+    name_of_cortex_based_mask = StringField()
 
-        # Expected binary data: variable-length string
-        data = read_variable_length_string(f)
-        header["Name of cortex-based mask"] = data
+    # -- Study info list (read manually — SSM field depends on glm_type)
+    studies = ObjectField(default_factory=list)
 
-        header["Study info"] = []
-        for i in range(header["Nr studies"]):
-            header["Study info"].append(dict())
+    # -- Predictor info list ---------------------------------------------
+    predictors_info = TypedSubRecordListField(
+        count_field="nr_all_predictors",
+        record_cls=PredictorInfo,
+        post_record_read=lambda f, p, r: f.read(9),
+    )
 
-            # Expected binary data: int (4 bytes)
-            data, = struct.unpack('<i', f.read(4))
-            header["Study info"][i]["Nr time points (volumes) in study"] = data
+    # -- Design matrix (non-RFX only) ------------------------------------
+    # Handled in _post_read_overrides
 
-            # Expected binary data: variable-length string
-            data = read_variable_length_string(f)
-            header["Study info"][i]["Name of study data"] = data
+    # -- Raw data (split into named arrays in _post_read) ----------------
+    _data_raw = DataField(dtype="<f", shape_fields=("_data_size",))
 
-            if header["Type (0: FMR-STC, 1:VMR-VTC, 2:SRF-MTC"] == 2:
-                data = read_variable_length_string(f)
-                header["Study info"][i]["Name of SSM"] = data
+    # -- I/O override for complex sections -------------------------------
 
-            # NOTE[Faruk]: Conflicting information in the documents. This might
-            # be called RTC filename
-            data = read_variable_length_string(f)
-            header["Study info"][i]["Name of SDM"] = data
+    @classmethod
+    def read(cls, filename, load_data=True):
+        instance = cls()
 
-        # ---------------------------------------------------------------------
-        header["Predictor info"] = list()
-        for i in range(header["Nr all predictors"]):
-                header["Predictor info"].append(dict())
+        with open(filename, "rb") as f:
+            # --- Standard fields until nr_studies spatial fields ---
+            for field in cls._fields:
+                if field.name == "studies":
+                    break
+                field.read(f, instance, load_data=load_data)
 
-                # Expected binary data: variable-length string
-                data = read_variable_length_string(f)
-                header["Predictor info"][i]["Name (internal)"] = data
-                data = read_variable_length_string(f)
-                header["Predictor info"][i]["Name (custom)"] = data
+            # --- Studies (manual: SSM name conditional on glm_type) ---
+            study_list = []
+            for _ in range(instance.nr_studies):
+                s = StudyInfo()
+                s.nr_time_points_in_study, = struct.unpack("<i", f.read(4))
+                s.name_of_study_data = read_variable_length_string(f)
+                if instance.glm_type == 2:
+                    s._values["name_of_ssm"] = read_variable_length_string(f)
+                s.name_of_sdm = read_variable_length_string(f)
+                study_list.append(s)
+            instance._values["studies"] = study_list
 
-                # Expected binary data: char (1 byte) x 3
-                data = read_RGB_bytes(f)
-                header["Predictor info"][i]["Color"] = data
+            # --- Continue: predictor info ---
+            # Find predictors_info position in _fields
+            start = next(i for i, fld in enumerate(cls._fields) if fld.name == "predictors_info")
+            for field in cls._fields[start:]:
+                if field.name == "_data_raw":
+                    break
+                field.read(f, instance, load_data=load_data)
 
-                # TODO: Unknown bytes, ask to senior dev. for documentation
-                f.read(9)
+            # --- nr_confounds_per_study ---
+            if instance.nr_studies > 1:
+                confounds = []
+                for _ in range(instance.nr_studies_with_confound_info):
+                    v, = struct.unpack("<i", f.read(4))
+                    confounds.append(v)
+                instance._values["nr_confounds_per_study"] = confounds
 
-        if header["RFX-GLM (0:std, 1:RFX)"] == 0:
-            # NOTE[Developer Guide - The Format Of GLM Files (v4)]: N x M float,
-            # design matrix. Outer loop: N rows (time points); Inner loop: M cols
-            # (predictors).
-            N = header["Nr time points"]
-            M = header["Nr all predictors"]
-            temp = np.zeros((N, M), dtype=np.float32)
-            for j in range(N):
-                for k in range(M):
-                    # Expected binary data: float (4 bytes)
-                    data, = struct.unpack('<f', f.read(4))
-                    temp[j, k] = float(data)
-            header["Design matrix"] = np.copy(temp)
+            # 9 unknown bytes already skipped by post_record_read callback
 
-            # NOTE[Developer Guide - The Format Of GLM Files (v4)]: M x M float.
-            # M rows, cols (predictors): Inverted X'X matrix
-            # (inv(transposed DM x DM))
-            temp = np.zeros((M, M), dtype=np.float32)
-            for j in range(M):
-                for k in range(M):
-                    # Expected binary data: float (4 bytes)
-                    data, = struct.unpack('<f', f.read(4))
-                    temp[j, k] = float(data)
-            header["Inverted X'X matrix"] = np.copy(temp)
+            # --- Design matrix + inverted X'X (non-RFX) ---
+            if instance.rfx_glm == 0:
+                N = instance.nr_time_points
+                M = instance.nr_all_predictors
+                dm = np.zeros((N, M), dtype=np.float32)
+                for j in range(N):
+                    for k in range(M):
+                        dm[j, k], = struct.unpack("<f", f.read(4))
+                instance._values["design_matrix"] = dm
 
-        # ---------------------------------------------------------------------
-        # Read GLM data (can represent voxels or vertices)
-        # ---------------------------------------------------------------------
-        # NOTE[Developer Guide - The Format Of GLM Files (v4)]: The actual data
-        # (outer loop: N values (e.g. betas); inner loop: M voxels/vertices).
-        if header["Type (0: FMR-STC, 1:VMR-VTC, 2:SRF-MTC"] == 0:
-            nr_data_points = header["DimX"] * header["DimY"] * header["DimZ"]
+                inv = np.zeros((M, M), dtype=np.float32)
+                for j in range(M):
+                    for k in range(M):
+                        inv[j, k], = struct.unpack("<f", f.read(4))
+                instance._values["inverted_xx_matrix"] = inv
 
-        elif header["Type (0: FMR-STC, 1:VMR-VTC, 2:SRF-MTC"] == 1:
-            range_X = header["XEnd"] - header["XStart"]
-            range_Y = header["YEnd"] - header["YStart"]
-            range_Z = header["ZEnd"] - header["ZStart"]
-            r = header["Resolution multiplier (1, 2, 3 times VMR resolution)"]
-            nr_data_points = (range_X // r) * (range_Y // r) * (range_Z // r)
+            # --- Data block ---
+            data_field = next(
+                fld for fld in cls._fields if fld.name == "_data_raw"
+            )
+            data_field.read(f, instance, load_data=load_data)
 
-        elif header["Type (0: FMR-STC, 1:VMR-VTC, 2:SRF-MTC"] == 2:
-            nr_data_points = header["Nr vertices"]
+        instance._split_data()
+        return instance
 
-        # NOTE[Developer Guide - The Format Of GLM Files (v4)]: The number of
-        # values (and, thus, the number of volume maps) differs with respect to
-        # the type of GLM.
-        if header["RFX-GLM (0:std, 1:RFX)"] == 1:
-            nr_data_point_values = (1 + header["Nr subjects"]
-                                    * header["Nr predictors per subject"])
+    # -- Computed properties ---------------------------------------------
 
-        if header["Serial correlation(0:no, 1:AR(1), 2:AR(2))"] == 0:
-            nr_data_point_values = 2 + 2 * header["Nr all predictors"] + 1
+    @property
+    def _nr_data_points(self):
+        if self.glm_type == 0:
+            return self.dim_x * self.dim_y * self.dim_z
+        elif self.glm_type == 1:
+            r = max(self.resolution_multiplier, 1)
+            rx = (self.x_end - self.x_start) // r
+            ry = (self.y_end - self.y_start) // r
+            rz = (self.z_end - self.z_start) // r
+            return rx * ry * rz
+        elif self.glm_type == 2:
+            return self.nr_vertices
+        return 0
 
-        # NOTE[Developer Guide - The Format Of GLM Files (v4)]: If AR(1)
-        # approach (first-order autoregressive model) has been used to correct
-        # serial correlations, one additional volume is stored.
-        elif header["Serial correlation(0:no, 1:AR(1), 2:AR(2))"] == 1:
-            nr_data_point_values = 2 + 2 * header["Nr all predictors"] + 2
+    @property
+    def _nr_maps(self):
+        sc = self.serial_correlation
+        P = self.nr_all_predictors
+        if sc == 0:
+            return 2 + 2 * P + 1
+        elif sc == 1:
+            return 2 + 2 * P + 2
+        elif sc == 2:
+            return 2 + 2 * P + 3
+        return 2 + 2 * P + 1
 
-        # NOTE[Developer Guide - The Format Of GLM Files (v4)]: If AR(2)
-        # approach (second-order autoregressive model) has been used, two
-        # additional values are stored.
-        elif header["Serial correlation(0:no, 1:AR(1), 2:AR(2))"] == 2:
-            nr_data_point_values = 2 + 2 * header["Nr all predictors"] + 3
+    @property
+    def _data_size(self):
+        return self._nr_maps * self._nr_data_points
 
-        # NOTE[Faruk]: I am saving this value because it is handy to have. Even
-        # though BrainVoyager documentation does not specify it explicitly.
-        header["Nr maps"] = nr_data_point_values
+    # -- Data splitting --------------------------------------------------
 
-        # NOTE[Developer Guide - The Format Of GLM Files (v4)]:
-        #     The first value (volume) of the data contains multiple
-        # correlation coefficient R indicating the goodness-of-fit for the
-        # respective voxel's time course and to allow to calculate the
-        # proportion of explained (R^2) and unexplained (1 - R^2) variance.
-        #     The second stored value per voxel contains the overall
-        # sum-of-squares term (SS_total) that can be used together with the R
-        # value to calculate the variance of the residuals.
-        #     Following the first two values, the estimated beta values are
-        # stored, i.e. one value for each predictor of the design matrix
-        # ("Nr all predictors" values).
-        #     Following the beta values, another set of "Nr all predictors"
-        # values follows containing the sum-of-squares indicating the
-        # covariation of each predictor with the time course data (SS_XiY).
-        # These values are stored to allow easy calculation of explained
-        # variance terms for restricted models (i.e. to allow application of
-        # the extra-sum-of-squares principle); these values may be probably
-        # ignored (not stored) for custom processing.
-        #     The next volume contains the mean value of the (normalized) fMRI
-        # time course.
-        #     Only in case that serial correlation correction has been
-        # performed, one or two more values are stored. In case that the AR(1)
-        # model has been used the estimated order 1 autocorrelation value
-        # (ACF(1) term) is stored for each voxel. In case that the AR(2) model
-        # has been used, the two estimated ACF terms are stored, i.e. the data
-        # contains one value more than in the case of the AR(1) model.
-        data_length = nr_data_point_values * nr_data_points
-        data_all = np.zeros(data_length, dtype=np.float32)
-        data_all = np.fromfile(f, dtype='<f', count=data_all.size, sep="",
-                               offset=0)
+    def _split_data(self):
+        raw = self._values.get("_data_raw")
+        if raw is None:
+            return
 
-        if header["Type (0: FMR-STC, 1:VMR-VTC, 2:SRF-MTC"] == 0:
-            dims = (nr_data_point_values,
-                    header["DimZ"], header["DimY"], header["DimX"])
-
-        elif header["Type (0: FMR-STC, 1:VMR-VTC, 2:SRF-MTC"] == 1:
-            r = header["Resolution multiplier (1, 2, 3 times VMR resolution)"]
-            dim_X = (header["XEnd"] - header["XStart"]) // r
-            dim_Y = (header["YEnd"] - header["YStart"]) // r
-            dim_Z = (header["ZEnd"] - header["ZStart"]) // r
-            dims = (nr_data_point_values, dim_Z, dim_Y, dim_X)
-
-        elif header["Type (0: FMR-STC, 1:VMR-VTC, 2:SRF-MTC"] == 2:
-            dim = (nr_data_point_values, header["Nr vertices"])
-
-        data_all = np.reshape(data_all, dims)
-        data_all = np.transpose(data_all, (1, 3, 2, 0))
-        data_all = data_all[::-1, ::-1, ::-1, :]
-
-        # ---------------------------------------------------------------------
-        # Parse into separate maps.
-        # ---------------------------------------------------------------------
-        # Multiple regression R values (multipleRegrR)
-        data_R2 = data_all[..., 0]
-
-        # Sum of squares values (mCorrSS)
-        data_SS = data_all[..., 1]
-
-        # Beta values (BetaMaps)
-        p = header["Nr all predictors"]
-        data_beta = data_all[..., 2:2+p]
-
-        # Sum-of-squares indicating the covariation of each predictor with the
-        # time course (SS_XiY).
-        data_SS_XiY = data_all[..., 2+p:2+p+p]
-
-        # Mean value of the (normalized) fMRI time course
-        data_meantc = np.squeeze(data_all[..., 2+p+p:2+p+p+1])
-
-        # arLag1 (Auto-regression lag value)
-        if header["Serial correlation(0:no, 1:AR(1), 2:AR(2))"] == 1:
-            data_ARlag = data_all[..., 2+p+p+1:2+p+p+2]
-        elif header["Serial correlation(0:no, 1:AR(1), 2:AR(2))"] == 2:
-            data_ARlag = data_all[..., 2+p+p+1:2+p+p+3]
+        P = self.nr_all_predictors
+        if self.glm_type == 2:
+            # Surface: 2D (maps, vertices)
+            maps = raw
         else:
-            data_ARlag = np.zeros(data_R2.shape)  # placeholder array
+            # Volume: reshape + BV → Tal
+            nr_maps = self._nr_maps
+            ndp = self._nr_data_points
+            if self.glm_type == 0:
+                z, y, x = self.dim_z, self.dim_y, self.dim_x
+            else:
+                r = max(self.resolution_multiplier, 1)
+                z = (self.z_end - self.z_start) // r
+                y = (self.y_end - self.y_start) // r
+                x = (self.x_end - self.x_start) // r
+            maps = raw.reshape(nr_maps, z, y, x)
+            maps = np.transpose(maps, (1, 3, 2, 0))
+            maps = maps[::-1, ::-1, ::-1, :]
 
-    return (header, data_R2, data_SS, data_beta, data_SS_XiY, data_meantc, data_ARlag)
+        self._values["data_R2"] = maps[..., 0]
+        self._values["data_SS"] = maps[..., 1]
+        self._values["data_beta"] = maps[..., 2:2 + P]
+
+        if maps.ndim >= 4:
+            self._values["data_SS_XiY"] = maps[..., 2 + P:2 + 2 * P]
+            self._values["data_meantc"] = np.squeeze(
+                maps[..., 2 + 2 * P:2 + 2 * P + 1]
+            )
+            sc = self.serial_correlation
+            if sc == 1:
+                self._values["data_ARlag"] = maps[
+                    ..., 2 + 2 * P + 1:2 + 2 * P + 2
+                ]
+            elif sc == 2:
+                self._values["data_ARlag"] = maps[
+                    ..., 2 + 2 * P + 1:2 + 2 * P + 3
+                ]
+            else:
+                self._values["data_ARlag"] = np.zeros(
+                    self._values["data_R2"].shape, dtype=np.float32
+                )
+        else:
+            # Surface: 2D arrays
+            self._values["data_SS_XiY"] = maps[2 + P:2 + 2 * P, :]
+            self._values["data_meantc"] = maps[2 + 2 * P, :]
+            sc = self.serial_correlation
+            if sc == 1:
+                self._values["data_ARlag"] = maps[2 + 2 * P + 1:2 + 2 * P + 2, :]
+            elif sc == 2:
+                self._values["data_ARlag"] = maps[2 + 2 * P + 1:2 + 2 * P + 3, :]
+            else:
+                self._values["data_ARlag"] = np.zeros(
+                    self._values["data_R2"].shape, dtype=np.float32
+                )
+
+    # -- Data accessors --------------------------------------------------
+
+    @property
+    def data_R2(self):
+        return self._values.get("data_R2")
+
+    @property
+    def data_SS(self):
+        return self._values.get("data_SS")
+
+    @property
+    def data_beta(self):
+        return self._values.get("data_beta")
+
+    @property
+    def data_SS_XiY(self):
+        return self._values.get("data_SS_XiY")
+
+    @property
+    def data_meantc(self):
+        return self._values.get("data_meantc")
+
+    @property
+    def data_ARlag(self):
+        return self._values.get("data_ARlag")
+
+    @property
+    def design_matrix(self):
+        return self._values.get("design_matrix")
+
+    @property
+    def inverted_xx_matrix(self):
+        return self._values.get("inverted_xx_matrix")
+
+    @property
+    def nr_confounds_per_study(self):
+        return self._values.get("nr_confounds_per_study", [])
+
+    # -- Legacy ----------------------------------------------------------
+
+    _LEGACY_MAP = {
+        "file_version": "File version",
+        "glm_type": "Type (0: FMR-STC, 1:VMR-VTC, 2:SRF-MTC",
+        "rfx_glm": "RFX-GLM (0:std, 1:RFX)",
+        "nr_subjects": "Nr subjects",
+        "nr_predictors_per_subject": "Nr predictors per subject",
+        "nr_time_points": "Nr time points",
+        "nr_all_predictors": "Nr all predictors",
+        "nr_confound_predictors": "Nr confound predictors",
+        "nr_studies": "Nr studies",
+        "nr_studies_with_confound_info": "Nr studies with confound info",
+        "separate_predictors": "Separate predictors (0:no, 1:studies, 2:subjects)",
+        "time_course_normalization": "Time course normalization (1:z transform, 2:baseline z, 3:percent change)",
+        "resolution_multiplier": "Resolution multiplier (1, 2, 3 times VMR resolution)",
+        "serial_correlation": "Serial correlation(0:no, 1:AR(1), 2:AR(2))",
+        "mean_serial_correlation_before": "Mean serial correlation before correction",
+        "mean_serial_correlation_after": "Mean serial correlation after correction",
+        "dim_x": "DimX",
+        "dim_y": "DimY",
+        "dim_z": "DimZ",
+        "x_start": "XStart",
+        "x_end": "XEnd",
+        "y_start": "YStart",
+        "y_end": "YEnd",
+        "z_start": "ZStart",
+        "z_end": "ZEnd",
+        "nr_vertices": "Nr vertices",
+        "cortex_based_mask": "Cortex-based mask (1:(grey matter) mask has been used)",
+        "nr_voxels_in_mask": "Nr voxels in mask",
+        "name_of_cortex_based_mask": "Name of cortex-based mask",
+        "_nr_maps": "Nr maps",
+    }
+
+    def to_legacy_dict(self):
+        result = {}
+        for py_name, legacy_name in self._LEGACY_MAP.items():
+            val = getattr(self, py_name)
+            if val is not None:
+                result[legacy_name] = val
+        # Study info
+        result["Study info"] = []
+        for s in (self.studies or []):
+            result["Study info"].append({
+                "Nr time points (volumes) in study": s.nr_time_points_in_study,
+                "Name of study data": s.name_of_study_data,
+                "Name of SSM": getattr(s, "name_of_ssm", ""),
+                "Name of SDM": s.name_of_sdm,
+            })
+        # Predictor info
+        result["Predictor info"] = []
+        for p in (self.predictors_info or []):
+            result["Predictor info"].append({
+                "Name (internal)": p.name_internal,
+                "Name (custom)": p.name_custom,
+                "Color": p.color,
+            })
+        result["Design matrix"] = self.design_matrix
+        result["Inverted X'X matrix"] = self.inverted_xx_matrix
+        result["Nr confounds per study"] = list(self.nr_confounds_per_study)
+        return result
+
+
+def read_glm(filename):
+    glm = GLM.read(filename)
+    return (
+        glm.to_legacy_dict(),
+        glm.data_R2,
+        glm.data_SS,
+        glm.data_beta,
+        glm.data_SS_XiY,
+        glm.data_meantc,
+        glm.data_ARlag,
+    )

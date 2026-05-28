@@ -1,125 +1,194 @@
-'''
-!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-!!!!!!! WORK IN PROGRESS !!!!!!
-!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+"""Read, write, create BrainVoyager MAP (statistical map) file format.
 
-BYTES	DATA TYPE	DEFAULT	DESCRIPTION
-2	short int	1	NrOfSlices/MapType (t, F, correlation, crosscorrelation etc.) (*1)
-2	short int	 	NrOfMaps (equal to NrOfSlices)
-2	short int	 	DimY (image dimension in number of pixels)
-2	short int	 	DimX (image dimension in number of pixels)
-2	short int	 	ClusterSize
-4	float	 	Statistical threshold, critical value
-4	float	 	Statistical threshold, max value
-2	short int	 	NrOfLags (ONLY PRESENT IF MapType = crosscorrelation)
-2	short int	9999	Reserved (MUST BE THIS VALUE)
-2	short int	3	FileVersion (Current version is 3)
-4   int             DF1 (only present if the file version is 3)
-4   int             DF2 (only present if the file version is 3)
-N	byte	<untitled>	Name of an RTC file (used to compute % signal changes etc.) (*2)
-(*2) Variable length, the end of the name is indicated by '0'.
-'''
+MAP is a binary format with interspersed slice markers: each 2-D float32
+slice is preceded by a short-int slice index.  The typed API overrides
+``read()`` / ``write()`` to handle this non-contiguous data layout.
 
-"""Read, write, create BrainVoyager MAP file format."""
+Typed API
+---------
+    mp = MAP.read("stats.map")
+    print(mp.nr_of_slices, mp.data.shape)
+    mp.write("output.map")
+"""
 
 import struct
 import numpy as np
-from bvbabel.utils import read_variable_length_string, read_RGB_bytes
-from bvbabel.utils import write_variable_length_string, write_RGB_bytes
+from bvbabel._binary_format import (
+    Field, StringField, DataField, BinaryFormat, register_format,
+)
+from bvbabel.utils import read_variable_length_string, write_variable_length_string
 
 
 # =============================================================================
-def read_map(filename):
-    """Read BrainVoyager MAP file.
+# MAP format
+# =============================================================================
 
-    Parameters
-    ----------
-    filename : string
-        Path to file.
+@register_format(".map")
+class MAP(BinaryFormat):
+    """Typed BrainVoyager MAP (2-D statistical map stack).
 
-    Returns
-    -------
-    header : dictionary
-        Pre-data and post-data headers.
-    data : 3D numpy.array
-        Image data.
-
+    Data is 3-D ``(Y, X, Z)`` after BV→Tal axis conversion.
     """
-    header = dict()
-    with open(filename, 'rb') as f:
-        # ---------------------------------------------------------------------
-        # NR-MAP Header (Version 2)
-        # ---------------------------------------------------------------------
 
-        # Expected binary data: short int (2 bytes)
-        data, = struct.unpack('<h', f.read(2))
-        header["MapType"] = 't-values'
-        header["NrOfSlices"] = int(data)
-        data, = struct.unpack('<h', f.read(2))
-        header["NrOfMaps"] = int(data)
-        data, = struct.unpack('<h', f.read(2))
-        header["DimX"] = int(data)
-        data, = struct.unpack('<h', f.read(2))
-        header["DimY"] = int(data)
-        data, = struct.unpack('<h', f.read(2))
-        header["ClusterSize"] = int(data)
+    # -- Header fields ---------------------------------------------------
+    map_type_code = Field("<h")   # also serves as nr_of_slices
+    nr_of_maps = Field("<h")
+    dim_x = Field("<h")
+    dim_y = Field("<h")
+    cluster_size = Field("<h")
 
-        # Expected binary data: float (4 bytes)
-        data, = struct.unpack('<f', f.read(4))
-        header["Min"] = data  # 	Statistical threshold, critical value
-        data, = struct.unpack('<f', f.read(4))
-        header["Max"] = data # 	Statistical threshold, max value
+    stat_threshold_min = Field("<f")
+    stat_threshold_max = Field("<f")
 
-        # Expected binary data: short int (2 bytes)
-        if header["MapType"] == 'crosscorrelation':
-	        data, = struct.unpack('<h', f.read(2))
-	        header["NrOfLags"] = int(data)
+    # Conditional: only when map_type_code == 3 (cross-correlation)
+    nr_of_lags = Field(
+        "<h", condition=lambda s: s.map_type_code == 3
+    )
 
-        # Expected binary data: short int (2 bytes) 
-        data, = struct.unpack('<h', f.read(2)) # Reserved field 9999
-        # Expected binary data: short int (2 bytes)
-        data, = struct.unpack('<h', f.read(2)) # Version 3
+    _reserved = Field("<h")         # always 9999
+    file_version = Field("<h")
 
-        data, = struct.unpack('<i', f.read(4)) # DF1
-        header["df1"] = int(data)
+    df1 = Field("<i")
+    df2 = Field("<i")
 
-        data, = struct.unpack('<i', f.read(4)) # DF2
-        header["df2"] = int(data)
+    rtc_name = StringField()
 
-        # Expected binary data: variable-length string
-        data = read_variable_length_string(f)  # Reserved field
-        header["RTCName"] = data
+    # -- Data (populated manually in read/write) -------------------------
+    data = DataField(dtype="<f", shape_fields=())
 
-        # ---------------------------------------------------------------------
-        # Read MAP image data
-        # ---------------------------------------------------------------------
-        # A map file contains NrOfMaps (= NrOfSlices) 2D statistical images. Each image contains DimY*DimX data points.
-        # Each data point (statistical value) is represented in 4 bytes (float). 
-        # Each slice is preceded by a 2 byte (short int) value representing the slice index (i.e. '0' for slice 1 and 'NrOfMaps-1' for the last slice). 
-        # There are some additional informations about MAP files which are specific to correlation and cross-correlation maps.
-        #
-        
-        data_img = []#np.zeros( header['NrOfSlices'] * header['DimY'] * header['DimX'])
+    # -- Derived ---------------------------------------------------------
 
-        for s in range(header['NrOfSlices']):
+    @property
+    def nr_of_slices(self):
+        return self.map_type_code
 
-            # Expected binary data: short int (2 bytes)
-            data, = struct.unpack('<h', f.read(2)) #Slice number
-            data_img.append(np.reshape(np.fromfile(f, dtype='<f', count=header['DimY'] * header['DimX'], sep="", offset=0), (header['DimX'],header['DimY']))[:,:,None]) # slice data
+    # -- I/O override ----------------------------------------------------
 
-            #print('Slice: ', data)
+    @classmethod
+    def read(cls, filename, load_data=True):
+        instance = cls()
+        with open(filename, "rb") as f:
+            # Header fields (standard binary iteration)
+            for field in cls._fields:
+                if field.name == "data":
+                    break  # stop before data — we handle it manually
+                field.read(f, instance, load_data=load_data)
 
-            temp_img = []
-            #for y in range(header['DimY']):
-            #    for x in range(header['DimX']):
-            #        data, = struct.unpack('<f', f.read(4))
-            #       temp_img.append(data)
-            #data_img.append(np.reshape(temp_img,(header['DimY'],header['DimX']))[:,:,None])
+            if not load_data:
+                # Skip data: each slice has 2-byte index + float32 data
+                slice_bytes = (2 + instance.dim_y * instance.dim_x * 4)
+                total = instance.nr_of_slices * slice_bytes
+                f.seek(total, 1)
+                instance._values["data"] = None
+                return instance
 
-        # -----------------------------------------------------------------
+            # Read slice-structured data
+            nr_slices = instance.nr_of_slices
+            slices = []
+            for _ in range(nr_slices):
+                slice_idx, = struct.unpack("<h", f.read(2))
+                slc = np.fromfile(
+                    f, dtype="<f", count=instance.dim_y * instance.dim_x
+                )
+                slc = slc.reshape(instance.dim_y, instance.dim_x)
+                slices.append(slc)
 
-    data_img = np.concatenate(data_img, axis=2) # stuck the slices
-    data_img = np.transpose(data_img, (1, 0, 2))
-    data_img = data_img[::-1, ::-1,:]  # Flip BV axes
+        data = np.stack(slices, axis=-1)  # (Y, X, Z)
+        # BV → Tal: transpose + flip
+        data = np.transpose(data, (1, 0, 2))  # (X, Y, Z)
+        data = data[::-1, ::-1, :]            # flip X, Y
+        instance._values["data"] = data
+        return instance
 
-    return header, data_img
+    def write(self, filename):
+        with open(filename, "wb") as f:
+            for field in self._fields:
+                if field.name == "data":
+                    break
+                field.write(f, self)
+
+            # Write slice-structured data
+            data = self._values.get("data")
+            if data is not None:
+                # Tal → BV: flip + transpose back
+                data = data[::-1, ::-1, :]
+                data = np.transpose(data, (1, 0, 2))  # (Y, X, Z)
+                nr_slices = data.shape[-1]
+                for s in range(nr_slices):
+                    f.write(struct.pack("<h", s))
+                    f.write(
+                        data[:, :, s].astype("<f").tobytes(order="C")
+                    )
+
+    # -- Factory ---------------------------------------------------------
+
+    @classmethod
+    def create_default(cls, dim_x=80, dim_y=80, nr_slices=16):
+        mp = cls()
+        mp.map_type_code = nr_slices  # doubles as nr_of_slices for type 1
+        mp.nr_of_maps = nr_slices
+        mp.dim_x = dim_x
+        mp.dim_y = dim_y
+        mp.cluster_size = 8
+        mp.stat_threshold_min = 0.5
+        mp.stat_threshold_max = 1.0
+        mp._reserved = 9999
+        mp.file_version = 3
+        mp.df1 = 0
+        mp.df2 = 0
+        mp.rtc_name = ""
+        mp.data = (
+            np.random.random((dim_y, dim_x, nr_slices)) * 2 - 1
+        ).astype(np.float32)
+        return mp
+
+    # -- Legacy key mapping ----------------------------------------------
+
+    _LEGACY_MAP = {
+        "map_type_code": "NrOfSlices",
+        "nr_of_maps": "NrOfMaps",
+        "dim_x": "DimX",
+        "dim_y": "DimY",
+        "cluster_size": "ClusterSize",
+        "stat_threshold_min": "Min",
+        "stat_threshold_max": "Max",
+        "nr_of_lags": "NrOfLags",
+        "_reserved": "Reserved",
+        "file_version": "FileVersion",
+        "df1": "df1",
+        "df2": "df2",
+        "rtc_name": "RTCName",
+    }
+    _LEGACY_REVERSE = {v: k for k, v in _LEGACY_MAP.items()}
+
+    def to_legacy_dict(self):
+        result = {}
+        for py_name, legacy_name in self._LEGACY_MAP.items():
+            result[legacy_name] = getattr(self, py_name)
+        result["MapType"] = "t-values"  # original hardcodes this
+        return result
+
+    @classmethod
+    def from_legacy_dict(cls, d, data=None):
+        kwargs = {}
+        for legacy_name, py_name in cls._LEGACY_REVERSE.items():
+            if legacy_name in d:
+                kwargs[py_name] = d[legacy_name]
+        instance = cls(**kwargs)
+        if data is not None:
+            instance.data = data
+        return instance
+
+
+# =============================================================================
+# Backward-compatible shims
+# =============================================================================
+
+def read_map(filename):
+    mp = MAP.read(filename)
+    return mp.to_legacy_dict(), mp.data
+
+
+def write_map(filename, header, data_img):
+    mp = MAP.from_legacy_dict(header, data=data_img)
+    mp.write(filename)

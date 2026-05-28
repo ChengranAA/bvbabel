@@ -1,182 +1,206 @@
-"""Read BrainVoyager SDM file format."""
+"""Read, write, create BrainVoyager SDM (design matrix) file format.
+
+Typed API
+---------
+    sdm = SDM.read("design.sdm")
+    print(sdm.nr_of_predictors, len(sdm.predictors))
+    for p in sdm.predictors:
+        print(p.name, p.values.shape)
+"""
 
 import numpy as np
+from bvbabel._binary_format import (
+    Field, ObjectField, Section, BinaryFormat, register_format,
+)
 
 
 # =============================================================================
+# Sub-objects
+# =============================================================================
+
+class SdmPredictor(Section):
+    """A single predictor column in the design matrix."""
+
+    name = Field(default="")
+    color = Field(default=None)   # [R, G, B]
+    values = Field(default=None)  # 1D float64 array
+
+
+# =============================================================================
+# SDM format
+# =============================================================================
+
+@register_format(".sdm")
+class SDM(BinaryFormat):
+    """Typed BrainVoyager SDM (single-subject design matrix)."""
+
+    file_version = Field(default=0)
+    nr_of_predictors = Field(default=0)
+    nr_of_data_points = Field(default=0)
+    includes_constant = Field(default=0)
+    first_confound_predictor = Field(default=0)
+
+    predictors = ObjectField(default_factory=list)
+
+    # -- I/O -------------------------------------------------------------
+
+    @classmethod
+    def read(cls, filename, load_data=True):
+        with open(filename, "r") as f:
+            lines = [r for r in (line.strip() for line in f) if r]
+
+        header = {}
+        for line in lines[:5]:
+            k, v = line.split(":", 1)
+            k, v = k.strip(), v.strip()
+            header[k] = int(v) if v.isdigit() else v
+
+        instance = cls()
+        instance.file_version = header.get("FileVersion", 0)
+        instance.nr_of_predictors = header.get("NrOfPredictors", 0)
+        instance.nr_of_data_points = header.get("NrOfDataPoints", 0)
+        instance.includes_constant = header.get("IncludesConstant", 0)
+        instance.first_confound_predictor = header.get(
+            "FirstConfoundPredictor", 0
+        )
+
+        nr_cols = instance.nr_of_predictors
+        nr_rows = instance.nr_of_data_points
+
+        # Column colors (line 5)
+        colors = [int(x) for x in lines[5].split() if x.lstrip("-").isdigit()]
+        col_rgb = [
+            [colors[i], colors[i + 1], colors[i + 2]]
+            for i in range(0, nr_cols * 3, 3)
+        ]
+
+        # Column names (line 6)
+        names = [n.strip('"') for n in lines[6].split('" "') if n]
+
+        # Column values (line 7+)
+        values = np.zeros((nr_rows, nr_cols))
+        for r, line in enumerate(lines[7 : 7 + nr_rows]):
+            tmp = line.replace("e-", "!@#$%")
+            tmp = tmp.replace("-", " -")
+            tmp = tmp.replace("!@#$%", "e-")
+            vals = [float(x) for x in tmp.split() if x]
+            values[r, :] = vals
+
+        predictors = []
+        for i in range(nr_cols):
+            predictors.append(SdmPredictor(
+                name=names[i] if i < len(names) else "",
+                color=col_rgb[i] if i < len(col_rgb) else [0, 0, 0],
+                values=values[:, i].copy(),
+            ))
+        instance.predictors = predictors
+        return instance
+
+    def write(self, filename):
+        with open(filename, "w") as f:
+            f.write(f"FileVersion:                   {self.file_version}\n\n")
+            f.write(f"NrOfPredictors:                {self.nr_of_predictors}\n")
+            f.write(f"NrOfDataPoints:                {self.nr_of_data_points}\n")
+            f.write(f"IncludesConstant:              {self.includes_constant}\n")
+            f.write(f"FirstConfoundPredictor:        {self.first_confound_predictor}\n\n")
+
+            preds = self.predictors or []
+            for i, p in enumerate(preds):
+                c = p.color or [0, 0, 0]
+                f.write(f"{c[0]} {c[1]} {c[2]}")
+                if i < len(preds) - 1:
+                    f.write("   ")
+            f.write("\n")
+
+            for i, p in enumerate(preds):
+                f.write(f'"{p.name}"')
+                if i < len(preds) - 1:
+                    f.write(" ")
+            f.write("\n")
+
+            nr_rows = self.nr_of_data_points
+            for r in range(nr_rows):
+                for j, p in enumerate(preds):
+                    v = p.values[r] if p.values is not None else 0.0
+                    f.write(f"{v:12.9f}")
+                    if j < len(preds) - 1:
+                        f.write(" ")
+                f.write("\n")
+
+    @classmethod
+    def create_default(cls, nr_predictors=3, nr_data_points=50):
+        sdm = cls()
+        sdm.file_version = 1
+        sdm.nr_of_predictors = nr_predictors
+        sdm.nr_of_data_points = nr_data_points
+        sdm.includes_constant = 0
+        sdm.first_confound_predictor = 1
+
+        colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255]]
+        preds = []
+        for i in range(nr_predictors):
+            preds.append(SdmPredictor(
+                name=f"Predictor {i + 1}",
+                color=colors[i % 3],
+                values=np.random.random(nr_data_points),
+            ))
+        sdm.predictors = preds
+        return sdm
+
+    # -- Legacy ----------------------------------------------------------
+
+    def to_legacy_dict(self):
+        return {
+            "FileVersion": self.file_version,
+            "NrOfPredictors": self.nr_of_predictors,
+            "NrOfDataPoints": self.nr_of_data_points,
+            "IncludesConstant": self.includes_constant,
+            "FirstConfoundPredictor": self.first_confound_predictor,
+        }
+
+    @classmethod
+    def from_legacy_dict(cls, d, data=None):
+        instance = cls()
+        instance.file_version = d.get("FileVersion", 0)
+        instance.nr_of_predictors = d.get("NrOfPredictors", 0)
+        instance.nr_of_data_points = d.get("NrOfDataPoints", 0)
+        instance.includes_constant = d.get("IncludesConstant", 0)
+        instance.first_confound_predictor = d.get("FirstConfoundPredictor", 0)
+        if data:
+            preds = []
+            for item in data:
+                preds.append(SdmPredictor(
+                    name=item.get("NameOfPredictor", ""),
+                    color=item.get("ColorOfPredictor", [0, 0, 0]),
+                    values=np.asarray(item.get("ValuesOfPredictor", [])),
+                ))
+            instance.predictors = preds
+        return instance
+
+
 def read_sdm(filename):
-    """Read BrainVoyager SDM file.
-
-    Parameters
-    ----------
-    filename : string
-        Path to file.
-
-    Returns
-    -------
-    header : dictionary
-        Single subjects design matrix (SDM) header. Also used for storing
-        motion estimates (*_3DMC.sdm).
-    data : list
-        Each element contains a dictionary that contains the information of
-        a single predictor.
-
-    """
-    # Read non-empty lines of the input text file
-    with open(filename, 'r') as f:
-        lines = [r for r in (line.strip() for line in f) if r]
-
-    # SDM header
-    header = dict()
-    header_rows = 5  # Nr of rows without empty lines
-    for line in lines[0:header_rows]:
-        content = line.split(":")
-        content = [i.strip() for i in content]
-        if content[1].isdigit():
-            header[content[0]] = int(content[1])
-        else:
-            header[content[0]] = content[1]
-
-    # -----------------------------------------------------------------------------
-    # SDM data columnns
-    nr_cols = header["NrOfPredictors"]
-    nr_rows = header["NrOfDataPoints"]
-
-    # Parse column colors (RGB integer triplets for each column)
-    col_rgb_row = 5
-    colors = [i for i in lines[col_rgb_row].split(" ") if i.isdigit()]
-    col_rgb = list()
-    for i in range(0, nr_cols*3, 3):
-        col_rgb.append([int(colors[i]), int(colors[i+1]), int(colors[i+2])])
-
-    # Parse column names
-    col_name_row = 6
-    col_name = [i.strip("\"") for i in lines[col_name_row].split("\" \"") if i]
-
-    # Parse column data
-    col_values_row = 7
-    col_values = np.zeros((nr_rows, nr_cols))
-    for r, line in enumerate(lines[col_values_row:]):
-        temp = line.replace("e-", "!@#$%")  # Preserve scientific notation
-        temp = temp.replace("-", " -")  # Separate concatenated columns
-        temp = temp.replace("!@#$%", "e-")  # Restore scientific notation
-        temp = temp.split(" ")
-        col_values[r, :] = [float(i.strip()) for i in temp if i]
-
-    # -----------------------------------------------------------------------------
-    # Reorganize column information
-    data = list()
-    for i in range(nr_cols):
-        temp = dict()
-        temp["NameOfPredictor"] = col_name[i]
-        temp["ColorOfPredictor"] = col_rgb[i]
-        temp["ValuesOfPredictor"] = col_values[:, i]
-        data.append(temp)
-
-    return header, data
+    sdm = SDM.read(filename)
+    data = []
+    for p in (sdm.predictors or []):
+        data.append({
+            "NameOfPredictor": p.name,
+            "ColorOfPredictor": p.color,
+            "ValuesOfPredictor": p.values,
+        })
+    return sdm.to_legacy_dict(), data
 
 
 def write_sdm(filename, header, data_sdm):
-    """Protocol to write BrainVoyager SDM file.
-
-    Parameters
-    ----------
-    filename : string
-        Path to file.
-    header : dictionary
-        Single subjects design matrix (SDM) header. Also used for storing
-        motion estimates (*_3DMC.sdm).
-    data_sdm : list
-        Each element contains a dictionary that contains the information of
-        a single predictor.
-
-    """
-    with open(filename, 'w') as f:
-        data = header["FileVersion"]
-        f.write("FileVersion:                   {}\n".format(data))
-        f.write("\n")
-
-        data = header["NrOfPredictors"]
-        f.write("NrOfPredictors:                {}\n".format(data))
-        data = header["NrOfDataPoints"]
-        f.write("NrOfDataPoints:                {}\n".format(data))
-        data = header["IncludesConstant"]
-        f.write("IncludesConstant:              {}\n".format(data))
-        data = header["FirstConfoundPredictor"]
-        f.write("FirstConfoundPredictor:        {}\n".format(data))
-        f.write("\n")
-
-        # ---------------------------------------------------------------------
-        # Write column colors
-        nr_cols = header["NrOfPredictors"]
-        for i in range(nr_cols):
-            f.write("{} {} {}".format(data_sdm[i]["ColorOfPredictor"][0],
-                                      data_sdm[i]["ColorOfPredictor"][1],
-                                      data_sdm[i]["ColorOfPredictor"][2]))
-            if i < nr_cols-1:
-                f.write("   ")
-            else:
-                f.write("\n")
-
-        # ---------------------------------------------------------------------
-        # Write column names
-        for i in range(nr_cols):
-            f.write("\"{}\"".format(data_sdm[i]["NameOfPredictor"]))
-            if i < nr_cols-1:
-                f.write(" ")
-            else:
-                f.write("\n")
-
-        # ---------------------------------------------------------------------
-        # Write column values
-        nr_rows = header["NrOfDataPoints"]
-        for i in range(nr_rows):
-            for j in range(nr_cols):
-                value = data_sdm[j]["ValuesOfPredictor"][i]
-                f.write("{:.9f}".format(value).rjust(12))
-                if j < nr_cols-1:
-                    f.write(" ")
-                else:
-                    f.write("\n")
+    SDM.from_legacy_dict(header, data=data_sdm).write(filename)
 
 
 def create_sdm():
-    """Create BrainVoyager SDM file with default values.
-
-    Returns
-    -------
-    header : dictionary
-        Single subjects design matrix (SDM) header. Also used for storing
-        motion estimates (*_3DMC.sdm).
-    data : list
-        Each element contains a dictionary that contains the information of
-        a single predictor.
-
-    """
-    header = dict()
-    header["FileVersion"] = 1
-    header["NrOfPredictors"] = 3
-    header["NrOfDataPoints"] = 50
-    header["IncludesConstant"] = 0
-    header["FirstConfoundPredictor"] = 1
-
-    # -------------------------------------------------------------------------
-    # Create random predictors as data
-    data = list()
-    temp = dict()
-    temp["NameOfPredictor"] = "Predictor 1"
-    temp["ColorOfPredictor"] = [255, 0, 0]
-    temp["ValuesOfPredictor"] = np.random.random(header["NrOfDataPoints"])
-    data.append(temp)
-
-    temp["NameOfPredictor"] = "Predictor 2"
-    temp["ColorOfPredictor"] = [0, 255, 0]
-    temp["ValuesOfPredictor"] = np.random.random(header["NrOfDataPoints"])
-    data.append(temp)
-
-    temp["NameOfPredictor"] = "Predictor 3"
-    temp["ColorOfPredictor"] = [0, 0, 255]
-    temp["ValuesOfPredictor"] = np.random.random(header["NrOfDataPoints"])
-    data.append(temp)
-
-    return header, data
+    sdm = SDM.create_default()
+    data = []
+    for p in sdm.predictors:
+        data.append({
+            "NameOfPredictor": p.name,
+            "ColorOfPredictor": p.color,
+            "ValuesOfPredictor": p.values,
+        })
+    return sdm.to_legacy_dict(), data

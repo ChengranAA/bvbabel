@@ -1,94 +1,61 @@
-"""Read, write, create BrainVoyager SSM file format."""
+"""Read, write, create BrainVoyager SSM (surface-to-surface mapping) file."""
 
-import struct
 import numpy as np
+from bvbabel._binary_format import (
+    Field, DataField, BinaryFormat, register_format,
+)
 
 
-# =============================================================================
+@register_format(".ssm")
+class SSM(BinaryFormat):
+    """Typed BrainVoyager SSM (vertex index mapping between surfaces)."""
+
+    file_version = Field("<h")
+    nr_vertices_1 = Field("<i")
+    nr_vertices_2 = Field("<i")
+
+    data = DataField(dtype="<i", shape_fields=("nr_vertices_1",))
+
+    @classmethod
+    def create_default(cls, nr_vertices=32492):
+        ssm = cls()
+        ssm.file_version = 2
+        ssm.nr_vertices_1 = int(nr_vertices)
+        ssm.nr_vertices_2 = int(nr_vertices)
+        ssm.data = np.arange(1, nr_vertices + 1, dtype=np.int32)
+        return ssm
+
+    _LEGACY_MAP = {
+        "file_version": "File version",
+        "nr_vertices_1": "Nr vertices 1",
+        "nr_vertices_2": "Nr vertices 2",
+    }
+    _LEGACY_REVERSE = {v: k for k, v in _LEGACY_MAP.items()}
+
+    def to_legacy_dict(self):
+        return {l: getattr(self, p) for p, l in self._LEGACY_MAP.items()}
+
+    @classmethod
+    def from_legacy_dict(cls, d, data=None):
+        kwargs = {}
+        for ln, pn in cls._LEGACY_REVERSE.items():
+            if ln in d:
+                kwargs[pn] = d[ln]
+        instance = cls(**kwargs)
+        if data is not None:
+            instance.data = data
+        return instance
+
+
 def read_ssm(filename):
-    """Read BrainVoyager SSM (surface to surface mapping) file.
-
-    Parameters
-    ----------
-    filename : string
-        Path to file.
-
-    Returns
-    -------
-    header : dictionary
-        Header containing SMP information.
-    data : 1D numpy.array
-        Data containing vertex indices
-
-    """
-    header = dict()
-    with open(filename, 'rb') as f:
-        # ---------------------------------------------------------------------
-        # Header
-        # ---------------------------------------------------------------------
-        # Expected binary data: short int (2 bytes)
-        data, = struct.unpack('<h', f.read(2))
-        header["File version"] = data
-
-        # Expected binary data: int (4 bytes)
-        data, = struct.unpack('<i', f.read(4))
-        header["Nr vertices 1"] = data
-        data, = struct.unpack('<i', f.read(4))
-        header["Nr vertices 2"] = data  # Referenced mesh number of vertices
-
-        # ---------------------------------------------------------------------
-        # Data
-        # ---------------------------------------------------------------------
-        data_ssm = np.zeros(header["Nr vertices 1"], dtype=int)
-        for i in range(header["Nr vertices 1"]):
-            data_ssm[i], = struct.unpack('<i', f.read(4))
-
-    return header, data_ssm
+    ssm = SSM.read(filename)
+    return ssm.to_legacy_dict(), ssm.data
 
 
 def write_ssm(filename, header, data_ssm):
-    """Protocol to write BrainVoyager SSM (surface to surface mapping) file.
-
-    Parameters
-    ----------
-    filename : string
-        Path to file.
-    header : dictionary
-        Header containing SMP information
-    data_ssm : 1D numpy.array
-        Data containing vertex indices
-
-    """
-    with open(filename, 'wb') as f:
-        # ---------------------------------------------------------------------
-        # Header
-        # ---------------------------------------------------------------------
-        # Expected binary data: short int (2 bytes)
-        data = header["File version"]
-        f.write(struct.pack('<h', data))
-
-        # Expected binary data: int (4 bytes)
-        data = header["Nr vertices 1"]
-        f.write(struct.pack('<i', data))
-        data = header["Nr vertices 2"]  # Referenced mesh number of vertices
-        f.write(struct.pack('<i', data))
-
-        # ---------------------------------------------------------------------
-        # Data
-        # ---------------------------------------------------------------------
-        f.write(data_ssm.astype("<i").tobytes(order="C"))
+    SSM.from_legacy_dict(header, data=data_ssm).write(filename)
 
 
 def create_ssm(nr_vertices=32492):
-    nr_vertices = int(nr_vertices)
-
-    # Create header
-    header = dict()
-    header["File version"] = 2
-    header["Nr vertices 1"] = nr_vertices
-    header["Nr vertices 2"] = nr_vertices
-
-    # Create data
-    data_ssm = np.arange(1, nr_vertices+1)
-
-    return header, data_ssm
+    ssm = SSM.create_default(nr_vertices)
+    return ssm.to_legacy_dict(), ssm.data

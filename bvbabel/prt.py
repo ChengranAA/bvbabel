@@ -1,188 +1,197 @@
-"""Read BrainVoyager PRT file format."""
+"""Read, write, create BrainVoyager PRT (protocol) file format."""
 
 import numpy as np
-from copy import copy
+from bvbabel._binary_format import (
+    Field, ObjectField, Section, BinaryFormat, register_format,
+)
 
 
-# =============================================================================
-def read_prt(filename):
-    """Read BrainVoyager PRT file.
+class PrtCondition(Section):
+    """A single experimental condition in a protocol."""
 
-    Parameters
-    ----------
-    filename : string
-        Path to file.
+    name = Field(default="")
+    nr_of_occurrences = Field(default=0)
+    time_start = Field(default=None)      # int array
+    time_stop = Field(default=None)       # int array
+    parametric_weight = Field(default=None)  # float array
+    color = Field(default=None)           # [R, G, B] int array
 
-    Returns
-    -------
-    header : dictionary
-        Protocol (PRT) header.
-    data_prt : list of dictionaries
-        TODO
 
-    """
-    # Read non-empty lines of the input text file
-    with open(filename, 'r') as f:
-        lines = [r for r in (line.strip().replace('\t',' ') for line in f) if r]
+@register_format(".prt")
+class PRT(BinaryFormat):
+    """Typed BrainVoyager PRT (stimulation protocol)."""
 
-    # PRT header
-    header = dict()
+    file_version = Field(default="")
+    resolution_of_time = Field(default="Volumes")
+    experiment = Field(default="")
+    background_color = Field(default="")
+    text_color = Field(default="")
+    time_course_color = Field(default="")
+    time_course_thick = Field(default="")
+    reference_func_color = Field(default="")
+    reference_func_thick = Field(default="")
+    parametric_weights = Field(default=0)
+    nr_of_conditions = Field(default=0)
 
-    for j in range(0, len(lines)):
-        line = lines[j]
-        content = line.strip()
-        content = content.split(":", 1)
-        content = [i.strip() for i in content]
+    conditions = ObjectField(default_factory=list)
 
-        if content[0].isdigit():
-            pass
-        elif content[0] == "FileVersion":
-            header[content[0]] = content[1]
-        elif content[0] == "ResolutionOfTime":
-            header[content[0]] = content[1]
-        elif content[0] == "Experiment":
-            header[content[0]] = content[1]
-        elif content[0] == "BackgroundColor":
-            header[content[0]] = content[1]
-        elif content[0] == "TextColor":
-            header[content[0]] = content[1]
-        elif content[0] == "TimeCourseColor":
-            header[content[0]] = content[1]
-        elif content[0] == "TimeCourseThick":
-            header[content[0]] = content[1]
-        elif content[0] == "ReferenceFuncColor":
-            header[content[0]] = content[1]
-        elif content[0] == "ReferenceFuncThick":
-            header[content[0]] = content[1]
+    @classmethod
+    def read(cls, filename, load_data=True):
+        with open(filename, "r") as f:
+            lines = [r for r in (line.strip().replace("\t", " ") for line in f) if r]
 
-        # NOTE: The "ParametricWeights" seems to appear with "FileVersion: 3"
-        elif content[0] == "ParametricWeights":
-            header[content[0]] = int(content[1])
+        instance = cls()
+        header = {}
+        header_rows = 0
 
-        elif content[0] == "NrOfConditions":
-            header[content[0]] = content[1]
-            header_rows = copy(j+1)
+        for j, line in enumerate(lines):
+            parts = line.split(":", 1)
+            parts = [p.strip() for p in parts]
+            if len(parts) < 2 or parts[0].isdigit():
+                continue
 
-    # -------------------------------------------------------------------------
-    # PRT data
-    data_prt = list()
-    count_c = 0  # Count condition
-    i = copy(header_rows)
-    while i < len(lines):
-        data_prt.append(dict())
+            key, val = parts[0], parts[1]
+            if key == "FileVersion":
+                instance.file_version = val
+            elif key == "ResolutionOfTime":
+                instance.resolution_of_time = val
+            elif key == "Experiment":
+                instance.experiment = val
+            elif key == "BackgroundColor":
+                instance.background_color = val
+            elif key == "TextColor":
+                instance.text_color = val
+            elif key == "TimeCourseColor":
+                instance.time_course_color = val
+            elif key == "TimeCourseThick":
+                instance.time_course_thick = val
+            elif key == "ReferenceFuncColor":
+                instance.reference_func_color = val
+            elif key == "ReferenceFuncThick":
+                instance.reference_func_thick = val
+            elif key == "ParametricWeights":
+                instance.parametric_weights = int(val)
+            elif key == "NrOfConditions":
+                instance.nr_of_conditions = int(val)
+                header_rows = j + 1
+                break
 
-        # Add condition name
-        data_prt[count_c]["NameOfCondition"] = lines[i]
+        # Parse conditions
+        conditions = []
+        i = header_rows
+        while i < len(lines) and len(conditions) < instance.nr_of_conditions:
+            cond = PrtCondition()
+            cond.name = lines[i]
+            n = int(lines[i + 1])
+            cond.nr_of_occurrences = n
 
-        # Add condition occurances
-        n = int(lines[i+1])
-        data_prt[count_c]["NrOfOccurances"] = n
+            t_start = np.zeros(n, dtype=int)
+            t_stop = np.zeros(n, dtype=int)
+            pw = np.zeros(n, dtype=float) if instance.parametric_weights > 0 else None
 
-        # Add timings
-        data_prt[count_c]["Time start"] = np.zeros(n, dtype=int)
-        data_prt[count_c]["Time stop"] = np.zeros(n, dtype=int)
-        for j in range(n):
-            values = lines[i+2+j].split()
-            if header["ResolutionOfTime"] == "Seconds":
-                data_prt[count_c]["Time start"][j] = int(float(values[0])*1000.0)
-                data_prt[count_c]["Time stop"][j] = int(float(values[1])*1000.0)
-            else:
-                data_prt[count_c]["Time start"][j] = int(values[0])
-                data_prt[count_c]["Time stop"][j] = int(values[1])
-
-        # Add parametric weights
-        if "ParametricWeights" in header and header["ParametricWeights"] > 0:
-            data_prt[count_c]["Parametric weight"] = np.zeros(n, dtype=float)
             for j in range(n):
-                values = lines[i+2+j].split()
-                data_prt[count_c]["Parametric weight"][j] = float(values[2])
-
-        # Add color
-        values = lines[i+2+n].split(" ")
-        data_prt[count_c]["Color"] = list()
-        for v in values:
-            if v.isdigit():
-                data_prt[count_c]["Color"].append(int(v))
-        data_prt[count_c]["Color"] = np.asarray(data_prt[count_c]["Color"])
-
-        i += n + 3
-        count_c += 1
-
-    if header["ResolutionOfTime"] == "Seconds":
-        header["ResolutionOfTime"] = "msec"
-    return header, data_prt
-
-
-# =============================================================================
-def write_prt(filename, header, data_prt):
-    """Protocol to write BrainVoyager PRT file.
-
-    Parameters
-    ----------
-    filename : string
-        Path to file.
-    header : dictionary
-        Protocol (PRT) header.
-    data_prt : list of dictionaries
-        TODO
-
-    """
-    with open(filename, 'w') as f:
-        f.write("\n")
-
-        data = header["FileVersion"]
-        f.write("FileVersion:        {}\n".format(data))
-        f.write("\n")
-
-        data = header["ResolutionOfTime"]
-        f.write("ResolutionOfTime:   {}\n".format(data))
-        f.write("\n")
-
-        data = header["Experiment"]
-        f.write("Experiment:         {}\n".format(data))
-        f.write("\n")
-
-        data = header["BackgroundColor"]
-        f.write("BackgroundColor:    {}\n".format(data))
-        data = header["TextColor"]
-        f.write("TextColor:          {}\n".format(data))
-        data = header["TimeCourseColor"]
-        f.write("TimeCourseColor:    {}\n".format(data))
-        data = header["TimeCourseThick"]
-        f.write("TimeCourseThick:    {}\n".format(data))
-        data = header["ReferenceFuncColor"]
-        f.write("ReferenceFuncColor: {}\n".format(data))
-        data = header["ReferenceFuncThick"]
-        f.write("ReferenceFuncThick: {}\n".format(data))
-        f.write("\n")
-
-        if "ParametricWeights" in header:
-            data = header["ParametricWeights"]
-            f.write("ParametricWeights: {}\n".format(data))
-            f.write("\n")
-
-        data = header["NrOfConditions"]
-        f.write("NrOfConditions: {}\n".format(data))
-
-        for i in range(len(data_prt)):
-            f.write("\n")
-            data = data_prt[i]["NameOfCondition"]
-            f.write("{}\n".format(data))
-            data = data_prt[i]["NrOfOccurances"]
-            f.write("{}\n".format(data))
-
-            for j in range(data_prt[i]["NrOfOccurances"]):
-                value1 = data_prt[i]["Time start"][j]
-                value2 = data_prt[i]["Time stop"][j]
-                if header["ResolutionOfTime"].lower() == "volumes":
-                    value1 = int(value1)
-                    value2 = int(value2)
-
-                if "ParametricWeights" in header and header["ParametricWeights"] > 0:
-                    value3 = data_prt[i]["Parametric weight"][j]
-                    f.write(f"{value1:>4} {value2:>4} {value3}\n")
+                vals = lines[i + 2 + j].split()
+                if instance.resolution_of_time == "Seconds":
+                    t_start[j] = int(float(vals[0]) * 1000.0)
+                    t_stop[j] = int(float(vals[1]) * 1000.0)
                 else:
-                    f.write(f"{value1:>4} {value2:>4}\n")
+                    t_start[j] = int(vals[0])
+                    t_stop[j] = int(vals[1])
+                if pw is not None:
+                    pw[j] = float(vals[2])
 
-            data = data_prt[i]["Color"]
-            f.write("Color: {} {} {}\n".format(data[0], data[1], data[2]))
+            cond.time_start = t_start
+            cond.time_stop = t_stop
+            if pw is not None:
+                cond.parametric_weight = pw
+
+            color_vals = [int(v) for v in lines[i + 2 + n].split() if v.lstrip("-").isdigit()]
+            cond.color = np.array(color_vals[:3])
+            conditions.append(cond)
+            i += n + 3
+
+        if instance.resolution_of_time == "Seconds":
+            instance.resolution_of_time = "msec"
+        instance.conditions = conditions
+        return instance
+
+    def write(self, filename):
+        with open(filename, "w") as f:
+            f.write(f"\nFileVersion:        {self.file_version}\n\n")
+            f.write(f"ResolutionOfTime:   {self.resolution_of_time}\n\n")
+            f.write(f"Experiment:         {self.experiment}\n\n")
+            f.write(f"BackgroundColor:    {self.background_color}\n")
+            f.write(f"TextColor:          {self.text_color}\n")
+            f.write(f"TimeCourseColor:    {self.time_course_color}\n")
+            f.write(f"TimeCourseThick:    {self.time_course_thick}\n")
+            f.write(f"ReferenceFuncColor: {self.reference_func_color}\n")
+            f.write(f"ReferenceFuncThick: {self.reference_func_thick}\n\n")
+            if self.parametric_weights:
+                f.write(f"ParametricWeights: {self.parametric_weights}\n\n")
+            f.write(f"NrOfConditions: {self.nr_of_conditions}\n")
+
+            for cond in (self.conditions or []):
+                f.write(f"\n{cond.name}\n")
+                f.write(f"{cond.nr_of_occurrences}\n")
+                for j in range(cond.nr_of_occurrences):
+                    v1 = cond.time_start[j] if cond.time_start is not None else 0
+                    v2 = cond.time_stop[j] if cond.time_stop is not None else 0
+                    if self.resolution_of_time.lower() == "volumes":
+                        v1, v2 = int(v1), int(v2)
+                    if cond.parametric_weight is not None:
+                        f.write(f"{v1:>4} {v2:>4} {cond.parametric_weight[j]}\n")
+                    else:
+                        f.write(f"{v1:>4} {v2:>4}\n")
+                c = cond.color if cond.color is not None else [0, 0, 0]
+                f.write(f"Color: {c[0]} {c[1]} {c[2]}\n")
+
+
+def read_prt(filename):
+    prt = PRT.read(filename)
+    h = {
+        "FileVersion": prt.file_version,
+        "ResolutionOfTime": prt.resolution_of_time,
+        "Experiment": prt.experiment,
+        "BackgroundColor": prt.background_color,
+        "TextColor": prt.text_color,
+        "TimeCourseColor": prt.time_course_color,
+        "TimeCourseThick": prt.time_course_thick,
+        "ReferenceFuncColor": prt.reference_func_color,
+        "ReferenceFuncThick": prt.reference_func_thick,
+        "ParametricWeights": prt.parametric_weights,
+        "NrOfConditions": prt.nr_of_conditions,
+    }
+    data = []
+    for c in (prt.conditions or []):
+        d = {
+            "NameOfCondition": c.name,
+            "NrOfOccurances": c.nr_of_occurrences,
+            "Time start": c.time_start,
+            "Time stop": c.time_stop,
+            "Color": c.color,
+        }
+        if c.parametric_weight is not None:
+            d["Parametric weight"] = c.parametric_weight
+        data.append(d)
+    return h, data
+
+
+def write_prt(filename, header, data_prt):
+    prt = PRT()
+    for k, v in header.items():
+        py = k[0].lower() + k[1:] if k else k
+        py = {"NrOfConditions": "nr_of_conditions"}.get(k, py)
+        if hasattr(prt, py):
+            setattr(prt, py, v)
+    conds = []
+    for d in data_prt:
+        c = PrtCondition()
+        c.name = d.get("NameOfCondition", "")
+        c.nr_of_occurrences = d.get("NrOfOccurances", 0)
+        c.time_start = d.get("Time start")
+        c.time_stop = d.get("Time stop")
+        c.color = d.get("Color")
+        c.parametric_weight = d.get("Parametric weight")
+        conds.append(c)
+    prt.conditions = conds
+    prt.write(filename)

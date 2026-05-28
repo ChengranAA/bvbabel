@@ -1,163 +1,290 @@
-""" Read and write BrainVoyager TRF file format."""
+"""Read, write, create BrainVoyager TRF (transformation) file format.
 
-import os
+TRF is a text format describing spatial transformations (rigid-body,
+affine, Talairach, MNI, etc.) between BrainVoyager datasets.
+
+Typed API
+---------
+    trf = TRF.read("alignment.trf")
+    print(trf.transformation_type, trf.matrix.shape)
+    trf.write("output.trf")
+"""
+
 import numpy as np
+from bvbabel._binary_format import (
+    Field, ObjectField, Section, BinaryFormat, register_format,
+)
 
-"""
-The format of TRF files
 
-Parameter: description of possible values
-
-"FileVersion:" 8 (current version)
-"DataFormat:" "Matrix"
-            4x4 float values (16 decimals)                
-"TransformationType:" 1-5 (int)
-                1. rigid body: 9 parameters. Order of parameters: 3 for scaling, 3 for rotation in degrees and 3 for translation
-                2. affine transformation: 16 parameters (4 x 4 matrix)
-                3. MNI (only with adjusted bounding box?)
-                4. Talairach transformation
-                5. "Untal" transformation: Talairach coordinate system to BrainVoyager coordinate system
-"CoordinateSystem:" 0-1
-"\n"
-"NSlicesFMRVMR:
-"SlThickFMRVMR:
-"SlGapFMRVMR:
-"CreateFMR3DMethod:
-"AlignmentStep:" 1: initial alignment 2: fine alignment
-"ExtraVMRTransf:" 0-1
-"SourceFile:" "C:/path/to/file.fmr"
-"TargetFile:" "C:/path/to/file.vmr"
-
-"""
+# =============================================================================
+# Section sub-objects
 # =============================================================================
 
+class TrfMatrixData(Section):
+    """Transformation matrix container."""
+
+    matrix = Field(default=None)          # 4×4 float64
+    extra_vmr_transf = Field(default=None)  # optional 4×4
+
+
+# =============================================================================
+# TRF format
+# =============================================================================
+
+@register_format(".trf")
+class TRF(BinaryFormat):
+    """Typed BrainVoyager TRF (spatial transformation)."""
+
+    # -- Header fields (populated by text parsing) -----------------------
+    file_version = Field(default=8)
+    data_format = Field(default="Matrix")
+    transformation_type = Field(default=0)
+    coordinate_system = Field(default=0)
+
+    n_slices_fmr_vmr = Field(default="")
+    sl_thick_fmr_vmr = Field(default="")
+    sl_gap_fmr_vmr = Field(default="")
+    create_fmr3d_method = Field(default="")
+    alignment_step = Field(default=0)
+    extra_vmr_transf_flag = Field(default=0)
+    to_vmr_framing_cube = Field(default="")
+    to_vmr_voxel_res = Field(default="")
+    acpc_vmr_framing_cube = Field(default="")
+    acpc_vmr_voxel_res = Field(default="")
+
+    x_scales_mni = Field(default=None)
+    y_scales_mni = Field(default=None)
+    z_scales_mni = Field(default=None)
+
+    source_file = Field(default="")
+    target_file = Field(default="")
+
+    # -- Sub-object ------------------------------------------------------
+    matrices = ObjectField(default_factory=TrfMatrixData)
+
+    # -- Data accessor (alias) -------------------------------------------
+
+    @property
+    def matrix(self):
+        return self.matrices.matrix if self.matrices else None
+
+    # -- I/O: text parsing -----------------------------------------------
+
+    @classmethod
+    def read(cls, filename, load_data=True):
+        instance = cls()
+        header = {}
+        has_vmr_trf = False
+
+        with open(filename, "r") as f:
+            lines = [r for r in (line.strip() for line in f) if r]
+
+        for line in lines:
+            parts = line.split(":", 1)
+            if len(parts) < 2:
+                continue
+            key = parts[0].strip()
+            value = parts[1].strip()
+
+            if value.isdigit() or (value.startswith("-") and value[1:].isdigit()):
+                header[key] = int(value)
+            else:
+                header[key] = value
+
+        # MNI scale lists
+        for key in ("xScalesMNI", "yScalesMNI", "zScalesMNI"):
+            if key in header and isinstance(header[key], str):
+                header[key] = [float(x) for x in header[key].split() if x]
+
+        if header.get("ExtraVMRTransf", 0) > 0:
+            has_vmr_trf = True
+
+        # Parse 4×4 matrices (follow the line containing "DataFormat" + "Matrix")
+        data = {}
+        for i, line in enumerate(lines):
+            if "DataFormat" in line and "Matrix" in line:
+                m44 = np.zeros((4, 4))
+                for j in range(1, 5):
+                    vals = lines[i + j].split()
+                    for k, v in enumerate(vals):
+                        m44[j - 1, k] = float(v)
+                data["Matrix"] = m44.copy()
+
+            if "ExtraVMRTransf" in line and has_vmr_trf and ":" in line:
+                m44b = np.zeros((4, 4))
+                for j in range(1, 5):
+                    vals = lines[i + j].split()
+                    for k, v in enumerate(vals):
+                        m44b[j - 1, k] = float(v)
+                data["ExtraVMRTransf"] = m44b.copy()
+
+        # Populate instance
+        for key, val in header.items():
+            py_name = {
+                "FileVersion": "file_version",
+                "DataFormat": "data_format",
+                "TransformationType": "transformation_type",
+                "CoordinateSystem": "coordinate_system",
+                "NSlicesFMRVMR": "n_slices_fmr_vmr",
+                "SlThickFMRVMR": "sl_thick_fmr_vmr",
+                "SlGapFMRVMR": "sl_gap_fmr_vmr",
+                "CreateFMR3DMethod": "create_fmr3d_method",
+                "AlignmentStep": "alignment_step",
+                "ExtraVMRTransf": "extra_vmr_transf_flag",
+                "ToVMRFramingCube": "to_vmr_framing_cube",
+                "ToVMRVoxelRes": "to_vmr_voxel_res",
+                "ACPCVMRFramingCube": "acpc_vmr_framing_cube",
+                "ACPCVMRVoxelRes": "acpc_vmr_voxel_res",
+                "xScalesMNI": "x_scales_mni",
+                "yScalesMNI": "y_scales_mni",
+                "zScalesMNI": "z_scales_mni",
+                "SourceFile": "source_file",
+                "TargetFile": "target_file",
+            }.get(key, key.lower())
+            if hasattr(instance, py_name):
+                setattr(instance, py_name, val)
+
+        instance.matrices = TrfMatrixData(
+            matrix=data.get("Matrix"),
+            extra_vmr_transf=data.get("ExtraVMRTransf"),
+        )
+        return instance
+
+    def write(self, filename):
+        h = self
+        m = self.matrices
+
+        with open(filename, "w") as f:
+            f.write(f"\nFileVersion:\t{h.file_version}\n\n")
+            f.write("DataFormat: \tMatrix\n\n")
+            if m.matrix is not None:
+                for i in range(4):
+                    f.write(
+                        " {:20.16f} {:20.16f} {:20.16f} {:20.16f}\n".format(
+                            m.matrix[i, 0], m.matrix[i, 1],
+                            m.matrix[i, 2], m.matrix[i, 3],
+                        )
+                    )
+            f.write(f"\nTransformationType: \t{h.transformation_type}\n")
+            f.write(f"CoordinateSystem: \t{h.coordinate_system}\n\n")
+
+            if h.transformation_type == 1:
+                f.write(f"NSlicesFMRVMR:\t\t{h.n_slices_fmr_vmr}\n")
+                f.write(f"SlThickFMRVMR:\t\t{h.sl_thick_fmr_vmr}\n")
+                f.write(f"SlGapFMRVMR:\t\t{h.sl_gap_fmr_vmr}\n")
+                f.write(f"CreateFMR3DMethod:\t{h.create_fmr3d_method}\n")
+                f.write(f"AlignmentStep:\t\t{h.alignment_step}\n\n")
+                if h.file_version > 4:
+                    f.write(f"ExtraVMRTransf:\t\t{h.extra_vmr_transf_flag}\n\n")
+                    if h.extra_vmr_transf_flag > 0 and m.extra_vmr_transf is not None:
+                        for i in range(4):
+                            f.write(
+                                " {:20.16f} {:20.16f} {:20.16f} {:20.16f}\n".format(
+                                    m.extra_vmr_transf[i, 0],
+                                    m.extra_vmr_transf[i, 1],
+                                    m.extra_vmr_transf[i, 2],
+                                    m.extra_vmr_transf[i, 3],
+                                )
+                            )
+                        f.write("\n")
+                if h.alignment_step == 1 and h.file_version > 5:
+                    f.write(f"ToVMRFramingCube:\t{h.to_vmr_framing_cube}\n")
+                    f.write(f"ToVMRVoxelRes:\t\t{h.to_vmr_voxel_res}\n\n")
+            elif h.transformation_type == 3:
+                for scale, name in [
+                    (h.x_scales_mni, "xScalesMNI"),
+                    (h.y_scales_mni, "yScalesMNI"),
+                    (h.z_scales_mni, "zScalesMNI"),
+                ]:
+                    if scale is not None and len(scale) >= 2:
+                        f.write(
+                            f"{name}:\t\t{scale[0]:>10.5f}\t"
+                            f"{scale[1]:>10.5f}\n"
+                        )
+                f.write("\n")
+
+            f.write(f"SourceFile:\t\t{h.source_file}\n")
+            f.write(f"TargetFile:\t\t{h.target_file}\n\n")
+
+            if h.transformation_type == 2 and "ACPC" in filename:
+                f.write(f"ACPCVMRFramingCube:\t{h.acpc_vmr_framing_cube}\n")
+                f.write(f"ACPCVMRVoxelRes:\t{h.acpc_vmr_voxel_res}\n\n")
+
+    # -- Factory ---------------------------------------------------------
+
+    @classmethod
+    def create_default(cls):
+        trf = cls()
+        trf.file_version = 8
+        trf.transformation_type = 2
+        trf.coordinate_system = 0
+        trf.source_file = ""
+        trf.target_file = ""
+        trf.matrices = TrfMatrixData(matrix=np.eye(4))
+        return trf
+
+    # -- Legacy key mapping ----------------------------------------------
+
+    _LEGACY_MAP = {
+        "file_version": "FileVersion",
+        "data_format": "DataFormat",
+        "transformation_type": "TransformationType",
+        "coordinate_system": "CoordinateSystem",
+        "n_slices_fmr_vmr": "NSlicesFMRVMR",
+        "sl_thick_fmr_vmr": "SlThickFMRVMR",
+        "sl_gap_fmr_vmr": "SlGapFMRVMR",
+        "create_fmr3d_method": "CreateFMR3DMethod",
+        "alignment_step": "AlignmentStep",
+        "extra_vmr_transf_flag": "ExtraVMRTransf",
+        "to_vmr_framing_cube": "ToVMRFramingCube",
+        "to_vmr_voxel_res": "ToVMRVoxelRes",
+        "acpc_vmr_framing_cube": "ACPCVMRFramingCube",
+        "acpc_vmr_voxel_res": "ACPCVMRVoxelRes",
+        "x_scales_mni": "xScalesMNI",
+        "y_scales_mni": "yScalesMNI",
+        "z_scales_mni": "zScalesMNI",
+        "source_file": "SourceFile",
+        "target_file": "TargetFile",
+    }
+    _LEGACY_REVERSE = {v: k for k, v in _LEGACY_MAP.items()}
+
+    def to_legacy_dict(self):
+        result = {}
+        for py_name, legacy_name in self._LEGACY_MAP.items():
+            result[legacy_name] = getattr(self, py_name)
+        return result
+
+    @classmethod
+    def from_legacy_dict(cls, d, data=None):
+        kwargs = {}
+        for legacy_name, py_name in cls._LEGACY_REVERSE.items():
+            if legacy_name in d:
+                kwargs[py_name] = d[legacy_name]
+        instance = cls(**kwargs)
+        if data is not None:
+            instance.matrices = TrfMatrixData(
+                matrix=data.get("Matrix"),
+                extra_vmr_transf=data.get("ExtraVMRTransf"),
+            )
+        return instance
+
+
+# =============================================================================
+# Backward-compatible shims
+# =============================================================================
 
 def read_trf(filename):
-    """Read Brainvoyager TRF file
-
-    Parameters
-    ----------
-    filename : string
-        Path to file.
-
-    Returns
-    -------
-    header : metadata; dictionary
-    data : dictionary; one dictionary with entry "Matrix" containing a transformation matrix (NumPy 4x4 array)
-        and possibly a matrix with key "ExtraVMRTransf" (NumPy 4x4 array)
-
-    Description
-    -------
-    An TRF file consists of the following header fields: see above.
-
-    Current TRF file version: 8
-    """
-
-    with open(filename, 'r') as f:
-        lines = [r for r in (line.strip() for line in f) if r]
-        has_vmr_trf = False
-        header = dict()
-        for line in lines:
-            content = line.split(":")
-            content = [i.strip() for i in content]
-            if len(content) > 1:
-                if content[1].isdigit():
-                    header[content[0]] = int(content[1])
-                else:
-                    header[content[0]] = content[1]
-
-    for i, key in enumerate(header):
-        if key.find("xScalesMNI") > -1 or key.find("yScalesMNI") > -1 or key.find("zScalesMNI") > -1:
-            tmp = header[key].split(' ')
-            header[key] = []
-            for r, t in enumerate(tmp):
-                if len(t) > 0:
-                    header[key].append(float(tmp[r]))
-
-        if key.find("ExtraVMRTransf") > -1:
-            if header["ExtraVMRTransf"] > 0:
-                has_vmr_trf = True
-
-    data = dict()
-    m44 = np.zeros((4, 4))
-    for i, line in enumerate(lines):
-
-        if line.find('Matrix') > -1:
-            for j in range(1, 5):
-                yvalues = lines[i+j].split()
-                for k in range(len(yvalues)):
-                    m44[j-1][k] = float(yvalues[k])
-            data["Matrix"] = m44
-
-        if line.find('ExtraVMRTransf') > -1 and has_vmr_trf:
-            m44b = np.zeros((4, 4))
-            for j in range(1, 5):
-                yvalues = lines[i+j].split()
-                for k in range(len(yvalues)):
-                    m44b[j-1][k] = float(yvalues[k])
-            data["ExtraVMRTransf"] = m44b
-
-    return header, data
+    trf = TRF.read(filename)
+    h = trf.to_legacy_dict()
+    m = trf.matrices
+    data = {}
+    if m.matrix is not None:
+        data["Matrix"] = m.matrix
+    if m.extra_vmr_transf is not None:
+        data["ExtraVMRTransf"] = m.extra_vmr_transf
+    return h, data
 
 
 def write_trf(filename, header, data):
-    """Write Brainvoyager TRF file.
-
-    Parameters
-    ----------
-    filename : string including path to file.
-    header : dictionary; metadata.
-    data : dictionary with 4x4 numpy.array(s) (transformation matrix)
-    """
-    with open(filename, "w") as f:
-
-        f.write("\nFileVersion:" + '\t' + str(header["FileVersion"]) + '\n\n')
-        f.write('DataFormat: \tMatrix\n\n')
-        for i in range(0, 4):
-            f.write(' ' + "{0:.16f}".format(data["Matrix"][i][0]).rjust(20) + ' ' + "{0:.16f}".format(data["Matrix"][i][1]).rjust(20) + ' '
-                    + "{0:.16f}".format(data["Matrix"][i][2]).rjust(20) + ' ' + "{0:.16f}".format(data["Matrix"][i][3]).rjust(20) + '\n')
-        f.write('\nTransformationType: ' + '\t' +
-                str(header["TransformationType"]) + '\n')
-        f.write('CoordinateSystem: ' + '\t' +
-                str(header["CoordinateSystem"]) + '\n\n')
-
-        if header["TransformationType"] == 1:  # coregistration: initial alignment file
-            f.write('NSlicesFMRVMR:' + '\t\t' +
-                    str(header["NSlicesFMRVMR"]) + '\n')
-            f.write('SlThickFMRVMR:' + '\t\t' +
-                    str(header["SlThickFMRVMR"]) + '\n')
-            f.write('SlGapFMRVMR:' + '\t\t' +
-                    str(header["SlGapFMRVMR"]) + '\n')
-            f.write('CreateFMR3DMethod:' + '\t' +
-                    str(header["CreateFMR3DMethod"]) + '\n')
-            f.write('AlignmentStep:' + '\t\t' +
-                    str(header["AlignmentStep"]) + '\n\n')
-            if header["FileVersion"] > 4:
-                f.write('ExtraVMRTransf:' + '\t\t' +
-                        str(header["ExtraVMRTransf"]) + '\n\n')
-                if header["ExtraVMRTransf"] > 0:
-                    for i in range(0, 4):
-                        f.write(' ' + "{0:.16f}".format(data["ExtraVMRTransf"][i][0]).rjust(20) + ' ' + "{0:.16f}".format(data["ExtraVMRTransf"][i][1]).rjust(20) + ' '
-                                + "{0:.16f}".format(data["ExtraVMRTransf"][i][2]).rjust(20) + ' ' + "{0:.16f}".format(data["ExtraVMRTransf"][i][3]).rjust(20) + '\n')
-                    f.write('\n')
-            if header["AlignmentStep"] == 1 and header["FileVersion"] > 5:  # initial alignment
-                f.write('ToVMRFramingCube:' + '\t' +
-                        str(header["ToVMRFramingCube"]) + '\n')
-                f.write('ToVMRVoxelRes:' + '\t\t' +
-                        str(header["ToVMRVoxelRes"]) + '\n\n')
-        elif header["TransformationType"] == 3:  # *_cMNI_adjBBX.trf
-            for scale in [("xScalesMNI", "\n"), ("yScalesMNI", "\n"), ("zScalesMNI", "\n\n")]:
-                f.write(scale[0] + ':' + '\t\t' + "{:>10.5f}".format(header[scale[0]][0]) + '\t' + "{:>10.5f}".format(header[scale[0]][1]) + scale[1])
-        elif header["TransformationType"] == 4:  # TAL
-            pass  # no example data available
-        elif header["TransformationType"] == 5:  # UNTAL
-            pass  # no example data available
-        f.write('SourceFile:' + '\t\t' + str(header["SourceFile"]) + '\n')
-        f.write('TargetFile:' + '\t\t' + str(header["TargetFile"]) + '\n\n')
-        # only for ACPC, not for MNI; fields present at least since 2016
-        if header["TransformationType"] == 2 and filename.find("ACPC") > -1:
-            f.write('ACPCVMRFramingCube:' + '\t' +
-                    str(header["ACPCVMRFramingCube"]) + '\n')
-            f.write('ACPCVMRVoxelRes:' + '\t' +
-                    str(header["ACPCVMRVoxelRes"]) + '\n\n')
-        f.close()  # officially not required
+    trf = TRF.from_legacy_dict(header, data=data)
+    trf.write(filename)

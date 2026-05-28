@@ -1,182 +1,96 @@
-"""Read, write, create BrainVoyager MTC file format."""
+"""Read, write, create BrainVoyager MTC (mesh time course) file format."""
 
-import struct
 import numpy as np
-from bvbabel.utils import read_variable_length_string, write_variable_length_string
+from bvbabel._binary_format import (
+    Field, StringField, DataField, BinaryFormat, register_format,
+)
 
 
-# =============================================================================
+@register_format(".mtc")
+class MTC(BinaryFormat):
+    """Typed BrainVoyager MTC (vertex-wise time course)."""
+
+    file_version = Field("<i")
+    nr_vertices = Field("<i")
+    nr_time_points = Field("<i")
+
+    vtc_name = StringField()
+    prt_name = StringField()
+
+    hemodynamic_delay = Field("<i")
+    tr = Field("<f")
+    delta = Field("<f")
+    tau = Field("<f")
+
+    segment_size = Field("<i")
+    segment_offset = Field("<i")
+    datatype = Field("<B")
+
+    data = DataField(
+        dtype="<f",
+        shape_fields=("nr_vertices", "nr_time_points"),
+    )
+
+    @classmethod
+    def create_default(cls, nr_vertices=3, nr_time_points=3):
+        mtc = cls()
+        mtc.file_version = 1
+        mtc.nr_vertices = nr_vertices
+        mtc.nr_time_points = nr_time_points
+        mtc.vtc_name = " "
+        mtc.prt_name = "<none>"
+        mtc.hemodynamic_delay = 1
+        mtc.tr = 1.0
+        mtc.delta = 2.5
+        mtc.tau = 1.25
+        mtc.segment_size = 10
+        mtc.segment_offset = 0
+        mtc.datatype = 1
+        mtc.data = (np.random.random(
+            (nr_vertices, nr_time_points)) * 2 - 1
+        ).astype(np.float32)
+        return mtc
+
+    _LEGACY_MAP = {
+        "file_version": "File version",
+        "nr_vertices": "Nr vertices",
+        "nr_time_points": "Nr time points",
+        "vtc_name": "VTC name",
+        "prt_name": "PRT name",
+        "hemodynamic_delay": "Hemodynamic delay",
+        "tr": "TR",
+        "delta": "delta",
+        "tau": "tau",
+        "segment_size": "segment size",
+        "segment_offset": "segment offset",
+        "datatype": "Datatype (1 = float)",
+    }
+    _LEGACY_REVERSE = {v: k for k, v in _LEGACY_MAP.items()}
+
+    def to_legacy_dict(self):
+        return {l: getattr(self, p) for p, l in self._LEGACY_MAP.items()}
+
+    @classmethod
+    def from_legacy_dict(cls, d, data=None):
+        kwargs = {}
+        for ln, pn in cls._LEGACY_REVERSE.items():
+            if ln in d:
+                kwargs[pn] = d[ln]
+        instance = cls(**kwargs)
+        if data is not None:
+            instance.data = data
+        return instance
+
+
 def read_mtc(filename):
-    """Read BrainVoyager MTC file.
-
-    Parameters
-    ----------
-    filename : string
-        Path to file.
-
-    Returns
-    -------
-    header : dictionary
-        Pre-data headers.
-    data : 2D numpy.array, (nr_vertices, time points)
-        Vertex-wise time points (float32).
-
-    """
-    header = dict()
-    data_mtc = dict()
-    with open(filename, 'rb') as f:
-        # Expected binary data: int (4 bytes)
-        data, = struct.unpack('<i', f.read(4))
-        header["File version"] = data
-        data, = struct.unpack('<i', f.read(4))
-        header["Nr vertices"] = data
-        data, = struct.unpack('<i', f.read(4))
-        header["Nr time points"] = data
-
-        # Expected binary data: variable-length string
-        data = read_variable_length_string(f)
-        header["VTC name"] = data
-        data = read_variable_length_string(f)
-        header["PRT name"] = data
-
-        # Expected binary data: int (4 bytes)
-        data, = struct.unpack('<i', f.read(4))
-        header["Hemodynamic delay"] = data
-
-        # Expected binary data: float (4 bytes)
-        data, = struct.unpack('<f', f.read(4))
-        header["TR"] = data
-        data, = struct.unpack('<f', f.read(4))
-        header["delta"] = data
-        data, = struct.unpack('<f', f.read(4))
-        header["tau"] = data
-
-        # Expected binary data: int (4 bytes)
-        data, = struct.unpack('<i', f.read(4))
-        header["segment size"] = data
-        data, = struct.unpack('<i', f.read(4))
-        header["segment offset"] = data
-
-        # Expected binary data: char (1 byte)
-        data, = struct.unpack('<B', f.read(1))
-        header["Datatype (1 = float)"] = data
-
-        # ---------------------------------------------------------------------
-        # Vertex-wise time points data
-        dims = (header["Nr vertices"], header["Nr time points"])
-        data_mtc = np.fromfile(f, dtype='<f', count=dims[0]*dims[1], sep="",
-                               offset=0)
-        data_mtc = np.reshape(data_mtc, dims)
-
-        return header, data_mtc
+    mtc = MTC.read(filename)
+    return mtc.to_legacy_dict(), mtc.data
 
 
-# =============================================================================
 def write_mtc(filename, header, data_mtc):
-    """Protocol to write BrainVoyager MTC file.
-
-    Parameters
-    ----------
-    filename : string
-        Path to file.
-    header : dictionary
-        Pre-data headers.
-    data_mtc : 2D numpy.array, (nr_vertices, time points)
-        Vertex-wise time points (float32).
-
-    """
-    with open(filename, 'wb') as f:
-        # Expected binary data: int (4 bytes)
-        data = header["File version"]
-        f.write(struct.pack('<i', data))
-        data = header["Nr vertices"]
-        f.write(struct.pack('<i', data))
-        data = header["Nr time points"]
-        f.write(struct.pack('<i', data))
-
-        # Expected binary data: variable-length string
-        data = header["VTC name"]
-        write_variable_length_string(f, data)
-        data = header["PRT name"]
-        write_variable_length_string(f, data)
-
-        # Expected binary data: int (4 bytes)
-        data = header["Hemodynamic delay"]
-        f.write(struct.pack('<i', data))
-
-        # Expected binary data: float (4 bytes)
-        data = header["TR"]
-        f.write(struct.pack('<f', data))
-        data = header["delta"]
-        f.write(struct.pack('<f', data))
-        data = header["tau"]
-        f.write(struct.pack('<f', data))
-
-        # Expected binary data: int (4 bytes)
-        data = header["segment size"]
-        f.write(struct.pack('<i', data))
-        data = header["segment offset"]
-        f.write(struct.pack('<i', data))
+    MTC.from_legacy_dict(header, data=data_mtc).write(filename)
 
 
-        # Expected binary data: char (1 byte)
-        data = header["Datatype (1 = float)"]
-        f.write(struct.pack('<B', data))
-
-        # ---------------------------------------------------------------------
-        # Vertex-wise time points data
-        dims = (header["Nr vertices"], header["Nr time points"])
-        data_mtc = np.reshape(data_mtc, dims[0] * dims[1])
-        for i in range(dims[0] * dims[1]):
-            f.write(struct.pack('<f', data_mtc[i]))
-
-        return header, data_mtc
-
-
-# =============================================================================
 def create_mtc():
-    """Create BrainVoyager MTC file with default values."""
-
-    header = dict()
-
-    # -------------------------------------------------------------------------
-    # MTC Header (Version 1)
-    # -------------------------------------------------------------------------
-
-    # Expected binary data: int (4 bytes)
-    header["File version"] = np.int32(1)
-    header["Nr vertices"] = np.int32(3)
-    header["Nr time points"] = np.int32(3) 
-
-    # Expected binary data: variable-length string
-    header["VTC name"] = " "
-    header["PRT name"] = "<none>"
-
-    # Expected binary data: int (4 bytes)
-    header["Hemodynamic delay"] = np.int32(1)
-
-    # Expected binary data: float (4 bytes)
-    header["TR"] = np.float32(1)
-    header["delta"] = np.float32(2.5)
-    header["tau"] = np.float32(1.25)
-
-    # Expected binary data: int (4 bytes)
-    header["segment size"] = np.int32(10)
-    header["segment offset"] = np.int32(0)
-
-    # Expected binary data: char (1 byte)
-    header["Datatype (1 = float)"] = np.byte(1)
-
-    # ---------------------------------------------------------------------
-    # Vertex-wise time points data
-    data_mtc = np.random.random(np.prod((3,3))) * 2 - 1
-    data_mtc = data_mtc.reshape((3,3))
-    data_mtc = data_mtc.astype(np.float32)
-
-    return header, data_mtc
-
-
-
-
-
-
+    mtc = MTC.create_default()
+    return mtc.to_legacy_dict(), mtc.data

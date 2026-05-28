@@ -59,7 +59,7 @@ class Field:
         Default value when the field has not been set.
     """
 
-    def __init__(self, fmt, condition=None, default=0):
+    def __init__(self, fmt="", condition=None, default=0):
         self.fmt = fmt
         self.condition = condition
         self.default = default
@@ -331,6 +331,49 @@ class TypedSubRecordListField:
                 self._post_record_write(f, instance, rec)
 
 
+
+# ---------------------------------------------------------------------------
+# Section and ObjectField
+# ---------------------------------------------------------------------------
+
+
+class Section:
+    """Lightweight container with Field descriptor support."""
+
+    def __init__(self, **kwargs):
+        self._values = {}
+        for key, val in kwargs.items():
+            self._values[key] = val
+
+
+class ObjectField:
+    """Descriptor storing a sub-object with no-op binary read/write."""
+
+    def __init__(self, default_factory=None):
+        self.default_factory = default_factory
+        self.name = None
+
+    def __set_name__(self, owner, name):
+        self.name = name
+
+    def __get__(self, instance, owner):
+        if instance is None:
+            return self
+        val = instance._values.get(self.name)
+        if val is None and self.default_factory is not None:
+            val = self.default_factory()
+            instance._values[self.name] = val
+        return val
+
+    def __set__(self, instance, value):
+        instance._values[self.name] = value
+
+    def read(self, f, instance, load_data=True):
+        pass
+
+    def write(self, f, instance):
+        pass
+
 # ---------------------------------------------------------------------------
 # Base class
 # ---------------------------------------------------------------------------
@@ -367,7 +410,7 @@ class BinaryFormat:
                     seen.add(f.name)
 
         _field_types = (Field, DataField, SubRecordListField,
-                        TypedSubRecordListField)
+                        TypedSubRecordListField, ObjectField)
         for name in cls.__dict__:
             value = cls.__dict__[name]
             if isinstance(value, _field_types):
