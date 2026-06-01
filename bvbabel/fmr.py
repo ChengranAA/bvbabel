@@ -190,9 +190,9 @@ class FMR(BinaryFormat):
             elif key == "SliceAcquisitionOrderVerified":
                 instance.slice_acquisition_order_verified = value
             elif key in ("ResolutionX", "NrOfColumns"):
-                instance.resolution_x = int(value)
+                instance.resolution_x = float(value)
             elif key in ("ResolutionY", "NrOfRows"):
-                instance.resolution_y = int(value)
+                instance.resolution_y = float(value)
             elif key == "LoadAMRFile":
                 instance.load_amr_file = value.strip('"')
             elif key == "ShowAMRFile":
@@ -388,8 +388,8 @@ class FMR(BinaryFormat):
                 stc_path,
                 nr_slices=instance.nr_of_slices,
                 nr_volumes=instance.nr_of_volumes,
-                res_x=instance.resolution_x,
-                res_y=instance.resolution_y,
+                res_x=int(instance.resolution_x),
+                res_y=int(instance.resolution_y),
                 data_type=instance.data_type,
                 rearrange_data_axes=True,
             )
