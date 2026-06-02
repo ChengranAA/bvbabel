@@ -31,14 +31,12 @@ from bvbabel.utils import (
 # ---------------------------------------------------------------------------
 
 def _bv_to_tal(data):
-    """Convert on-disk BV axis layout to logical (Talairach-like) layout.
+    """Convert on-disk BV axis layout to logical layout.
 
-    BV internal stores data as [Z, Y, X] in C order.  The on-disk byte
-    layout already has X varying fastest, then Y, then Z — matching the
-    pre-header DimX/DimY/DimZ declaration.  Only a spatial flip is needed
-    to reconcile BV's radiological convention with NIfTI RAS+.
+    BV internal stores data as [Z, Y, X] in C order matching the pre-header.
+    No spatial transform is needed — BV handles radiological convention
+    internally.  Data passes through unchanged.
     """
-    data = data[::-1, ::-1, ::-1]
     return data
 
 
