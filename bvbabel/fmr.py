@@ -591,19 +591,20 @@ class FMR(BinaryFormat):
         return fmr
 
     @classmethod
-    def from_nifti(cls, nifti_path, prefix="bv_fmr"):
+    def from_nifti(cls, nifti_path):
         """Create an FMR from a 4D NIfTI file.
 
         Passes RAS+ NIfTI data directly to ``FMR.data`` — the
         ``write_stc(rearrange_data_axes=True)`` call inside ``write()``
         handles the BV-oriented STC layout automatically.
 
+        The prefix (used for the paired ``.stc`` file) is set by
+        ``write()`` from the output filename.
+
         Parameters
         ----------
         nifti_path : str
             Path to a ``.nii`` or ``.nii.gz`` 4D NIfTI file.
-        prefix : str
-            Base name for the ``.fmr`` / ``.stc`` file pair.
 
         Returns
         -------
@@ -630,7 +631,6 @@ class FMR(BinaryFormat):
         fmr.file_version = "7"
         fmr.nr_of_volumes = nr_volumes
         fmr.nr_of_slices = nr_slices
-        fmr.prefix = prefix
         fmr.data_storage_format = 2
         fmr.data_type = 2  # float32
         fmr.tr = str(int(zooms[3] * 1000))
