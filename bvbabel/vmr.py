@@ -247,6 +247,57 @@ class VMR(BinaryFormat):
         ).reshape(shape)
         return vmr
 
+    @classmethod
+    def from_nifti(cls, nifti_path):
+        """Create a VMR from a NIfTI file, reorienting RAS+ → BV layout.
+
+        Handles the full conversion: axis permutation, spatial flips,
+        intensity normalisation to uint8 (0–225), and voxel-size transfer.
+
+        Parameters
+        ----------
+        nifti_path : str
+            Path to a ``.nii`` or ``.nii.gz`` 3D NIfTI file.
+
+        Returns
+        -------
+        VMR instance with ``data`` set and all header fields populated.
+        """
+        try:
+            import nibabel as nib
+        except ImportError:
+            raise ImportError("nibabel is required for NIfTI import")
+
+        img = nib.load(nifti_path)
+        data = img.get_fdata().astype(np.float32)
+        zooms = img.header.get_zooms()
+
+        if len(data.shape) != 3:
+            raise ValueError(f"Expected 3D NIfTI, got shape {data.shape}")
+
+        # Permute NIfTI [X, Y, Z] → BV [Z, Y, X] and flip for convention
+        bv = np.transpose(data, (0, 2, 1))  # [X, Z, Y]
+        bv = bv[::-1, ::-1, ::-1]          # flip all three axes
+
+        # Normalise to uint8
+        p2, p98 = np.percentile(bv[bv > 0], [2, 98])
+        bv_u8 = np.clip((bv - p2) / (p98 - p2) * 225, 0, 225).astype(np.uint8)
+
+        vmr = cls()
+        vmr.file_version = 4
+        vmr.dim_x = bv.shape[2]
+        vmr.dim_y = bv.shape[1]
+        vmr.dim_z = bv.shape[0]
+        vmr.data = bv_u8
+
+        # Voxel sizes: NIfTI Y → BV X, NIfTI Z → BV Y, NIfTI X → BV Z
+        vmr.voxel_size_x = zooms[1]
+        vmr.voxel_size_y = zooms[2]
+        vmr.voxel_size_z = zooms[0]
+        vmr.slice_thickness = zooms[2]
+
+        return vmr
+
 
 # =============================================================================
 # Backward-compatible procedural shims

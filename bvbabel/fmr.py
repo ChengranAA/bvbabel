@@ -590,6 +590,95 @@ class FMR(BinaryFormat):
         ).reshape(dims)
         return fmr
 
+    @classmethod
+    def from_nifti(cls, nifti_path, prefix="bv_fmr"):
+        """Create an FMR from a 4D NIfTI file.
+
+        Passes RAS+ NIfTI data directly to ``FMR.data`` — the
+        ``write_stc(rearrange_data_axes=True)`` call inside ``write()``
+        handles the BV-oriented STC layout automatically.
+
+        Parameters
+        ----------
+        nifti_path : str
+            Path to a ``.nii`` or ``.nii.gz`` 4D NIfTI file.
+        prefix : str
+            Base name for the ``.fmr`` / ``.stc`` file pair.
+
+        Returns
+        -------
+        FMR instance with header and data populated.
+        """
+        try:
+            import nibabel as nib
+        except ImportError:
+            raise ImportError("nibabel is required for NIfTI import")
+
+        img = nib.load(nifti_path)
+        data = img.get_fdata().astype(np.float32)
+        zooms = img.header.get_zooms()
+
+        if len(data.shape) != 4:
+            raise ValueError(f"Expected 4D NIfTI, got shape {data.shape}")
+
+        nr_volumes = data.shape[3]
+        nr_slices = data.shape[2]
+        res_x = data.shape[0]
+        res_y = data.shape[1]
+
+        fmr = cls()
+        fmr.file_version = "7"
+        fmr.nr_of_volumes = nr_volumes
+        fmr.nr_of_slices = nr_slices
+        fmr.prefix = prefix
+        fmr.data_storage_format = 2
+        fmr.data_type = 2  # float32
+        fmr.tr = str(int(zooms[3] * 1000))
+        fmr.inter_slice_time = "0"
+        fmr.time_resolution_verified = "1"
+        fmr.te = "30"
+        fmr.slice_acquisition_order = "5"
+        fmr.slice_acquisition_order_verified = "1"
+        fmr.resolution_x = res_x
+        fmr.resolution_y = res_y
+        fmr.inplane_resolution_x = str(zooms[0])
+        fmr.inplane_resolution_y = str(zooms[1])
+        fmr.slice_thickness = str(zooms[2])
+        fmr.slice_gap = "0"
+        fmr.voxel_resolution_verified = "1"
+        fmr.left_right_convention = "0"
+        fmr.layout_n_columns = str(int(np.ceil(np.sqrt(nr_slices))))
+        fmr.layout_n_rows = str(int(np.ceil(np.sqrt(nr_slices))))
+        fmr.layout_zoom_level = "1"
+        fmr.segment_size = "10"
+        fmr.segment_offset = "0"
+
+        # Pass RAS+ data — write_stc(rearrange=True) converts to BV layout
+        fmr.data = data
+
+        # Position info matching the data dimensions
+        fmr.position = FmrPositionInfo(
+            pos_infos_verified="1",
+            coordinate_system="1",
+            slice_1_center_x=str(-zooms[0] * (res_x - 1) / 2),
+            slice_1_center_y=str(-zooms[1] * (res_y - 1) / 2),
+            slice_1_center_z=str(-zooms[2] * (nr_slices - 1) / 2),
+            slice_n_center_x=str(zooms[0] * (res_x - 1) / 2),
+            slice_n_center_y=str(zooms[1] * (res_y - 1) / 2),
+            slice_n_center_z=str(zooms[2] * (nr_slices - 1) / 2),
+            row_dir_x="1.0", row_dir_y="0.0", row_dir_z="0.0",
+            col_dir_x="0.0", col_dir_y="1.0", col_dir_z="0.0",
+            n_rows=str(res_y), n_cols=str(res_x),
+            fov_rows=str(res_y * zooms[1]),
+            fov_cols=str(res_x * zooms[0]),
+            slice_thickness=str(zooms[2]),
+            gap_thickness="0",
+        )
+        fmr.transform = FmrTransformInfo()
+        fmr.multiband = FmrMultibandInfo()
+
+        return fmr
+
     # -- Legacy key mapping ----------------------------------------------
 
     _LEGACY_MAP = {
