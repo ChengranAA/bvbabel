@@ -26,22 +26,6 @@ from bvbabel.utils import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Axis transforms (BV internal ↔ Talairach / NIfTI RAS-like)
-# ---------------------------------------------------------------------------
-
-def _bv_to_tal(data):
-    """Convert on-disk BV axis layout to logical layout.
-
-    BV internal stores data as [Z, Y, X] in C order matching the pre-header.
-    No spatial transform is needed — BV handles radiological convention
-    internally.  Data passes through unchanged.
-    """
-    return data
-
-
-_bv_to_tal_inv = _bv_to_tal  # flip is its own inverse
-
 
 # ---------------------------------------------------------------------------
 # Past-transformation sub-record helpers
@@ -95,12 +79,10 @@ class VMR(BinaryFormat):
     dim_y = Field("<H")
     dim_z = Field("<H")
 
-    # -- Voxel data (BV internal layout → Talairach layout on read) ------
+    # -- Voxel data -----------------------------------------------------
     data = DataField(
         dtype="<B",
         shape_fields=("dim_z", "dim_y", "dim_x"),
-        transform=_bv_to_tal,
-        inverse_transform=_bv_to_tal_inv,
     )
 
     # -- Post-data header ------------------------------------------------

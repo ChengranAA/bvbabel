@@ -21,18 +21,6 @@ from bvbabel._binary_format import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Axis transforms
-# ---------------------------------------------------------------------------
-
-def _bv_to_tal(data):
-    data = np.transpose(data, (0, 2, 1))
-    data = data[::-1, ::-1, ::-1]
-    return data
-
-
-_bv_to_tal_inv = _bv_to_tal
-
 
 # ---------------------------------------------------------------------------
 # Typed MSK format
@@ -53,8 +41,6 @@ class MSK(BinaryFormat):
     data = DataField(
         dtype="<B",
         shape_fields=("dim_z", "dim_y", "dim_x"),
-        transform=_bv_to_tal,
-        inverse_transform=_bv_to_tal_inv,
     )
 
     # -- Derived properties ----------------------------------------------
